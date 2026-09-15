@@ -53,6 +53,15 @@ an unmapped local session on macOS opens a **Ghostty pane chooser**. Choose the
 matching pane yourself. Subsequent navigation uses that saved mapping while
 its PID and start time still match. Ghostty 1.3+ and its AppleScript integration
 are required for Ghostty navigation; macOS may request Automation permission.
+Ghostty focus leaves TTYbird running in its original pane. Return to that pane
+to select another agent; `q` closes the dashboard.
+
+For a split view, press `p`: the agent list stays on the left and the selected
+local tmux pane's screen appears on the right, refreshing every two seconds.
+This preview is read-only; Enter returns to the actual terminal for typing.
+It needs a window at least 105 columns wide (narrower windows stack the views).
+Plain Ghostty tabs do not expose a supported live screen-reading API; run the
+agent inside tmux in Ghostty to use the preview.
 
 Nix users can build the pinned package or enter the dev shell; see [Nix](docs/NIX.md).
 For a source build, install Rust 1.90+ and **Zig 0.15.2**:

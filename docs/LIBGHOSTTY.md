@@ -34,8 +34,8 @@ terminal emulation from terminal capture and Ghostty application control.
   it is not an API for attaching to a separately running Ghostty process.
 - [Ghostty AppleScript](https://ghostty.org/docs/features/applescript) is a
   separate macOS automation API for enumerating windows, tabs, and terminal
-  surfaces and focusing an exact surface ID. It does not expose terminal screen
-  text.
+  surfaces and focusing an exact surface ID. It has no direct screen-text
+  property or result API.
 
 The 1.3.1 source only exposes the earlier, smaller `libghostty-vt` header set.
 The modular terminal, render, formatter, snapshot, and search surface visible
@@ -151,8 +151,11 @@ identity.
 
 AppleScript `focus` is application navigation; AppleScript `input text`, key,
 and mouse commands are separate write operations and are not needed by
-TTYbird. Neither AppleScript nor `libghostty-vt` supplies the bytes shown in an
-already running Ghostty surface.
+TTYbird. `libghostty-vt` cannot retrieve another running Ghostty surface.
+AppleScript can invoke [`write_screen_file:copy`](https://ghostty.org/docs/config/keybind/reference#write_screen_file),
+but that action writes a temporary file and replaces the clipboard with its
+path. It is unsuitable for TTYbird's read-only live preview polling. TTYbird
+currently obtains preview bytes only from a verified local tmux pane.
 
 For remote hosts, `libghostty-vt` can parse bytes after TTYbird obtains them,
 but it provides no transport or remote pane discovery. A future remote preview

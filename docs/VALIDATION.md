@@ -36,7 +36,7 @@ explicitly; CI runs it in addition to the ordinary suite.
 | VT conversion | Pinned native libghostty-vt parses captures; owned text/styles are rendered by Ratatui | Full Ghostty GUI renderer equivalence, arbitrary PTY streams or graphics |
 | tmux preview | Real private pane; colors/Unicode/CR/erase, alternate screen, wrong identity, unchanged pane/buffers | Arbitrary tmux versions and remote capture |
 | Dashboard | Real PTY, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings, preview close/reopen | Exhaustive terminal emulators/keymaps |
-| Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection and exact-ID focus invocation | A GUI end-to-end focus test on every Ghostty version |
+| Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection, exact-ID focus invocation, failed-focus binding rollback, dashboard retained after picker/saved focus, q restoration | A GUI end-to-end focus test on every Ghostty version |
 | SSH collector | Fixed command, versioned protocol, invalid destination rejection, bounded child execution | Authenticated multi-host network test |
 | Release portability | CI-native build and library reference check, version execution before packaging | Notarization, signing, all macOS/Linux versions |
 

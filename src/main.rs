@@ -445,6 +445,16 @@ fn bind_picker_session(
 }
 
 fn focus(cli: &Cli, dir: &std::path::Path, id: &str, host: &Option<String>) -> Result<()> {
+    focus_checked(cli, dir, id, host, false)
+}
+
+fn focus_checked(
+    cli: &Cli,
+    dir: &std::path::Path,
+    id: &str,
+    host: &Option<String>,
+    ghostty_only: bool,
+) -> Result<()> {
     if let Some(host) = host {
         let config = config::read(dir)?;
         let entry = config
@@ -492,6 +502,9 @@ fn focus(cli: &Cli, dir: &std::path::Path, id: &str, host: &Option<String>) -> R
         .target
         .as_ref()
         .context("no terminal mapping; use terminals then bind, or run inside tmux")?;
+    if ghostty_only && !matches!(target, Target::Ghostty { .. }) {
+        bail!("terminal binding changed; refusing to attach over the dashboard");
+    }
     if let Some(target_tty) = navigation::target_tty(target)? {
         let process_tty = s
             .tty
@@ -502,6 +515,38 @@ fn focus(cli: &Cli, dir: &std::path::Path, id: &str, host: &Option<String>) -> R
         }
     }
     navigation::focus(target)
+}
+
+type FocusResult = std::result::Result<Option<Binding>, String>;
+
+// AppleScript switches a different surface; it does not need this terminal.
+// Keep the dashboard and its event loop alive while revalidating and focusing.
+fn focus_ghostty_from_dashboard(
+    cli: &Cli,
+    dir: &std::path::Path,
+    id: String,
+    pending: Option<PendingBinding>,
+) -> std::sync::mpsc::Receiver<FocusResult> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let cli = cli.clone();
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let result = match focus_checked(&cli, &dir, &id, &None, true) {
+            Ok(()) => Ok(pending.map(|binding| binding.saved)),
+            Err(error) => {
+                let rollback = pending
+                    .as_ref()
+                    .map(|binding| rollback_picker_binding(&dir, binding))
+                    .transpose();
+                Err(match rollback {
+                    Ok(_) => format!("{error:#}"),
+                    Err(rollback) => format!("{error:#}; binding rollback failed: {rollback:#}"),
+                })
+            }
+        };
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 /// Ratatui's `Terminal` destructor tries to show a cursor it previously hid.
@@ -688,6 +733,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
     requests.try_send(()).ok();
     app.refreshing = true;
     let mut last_request = Instant::now();
+    let mut discard_refresh = false;
     // Preview is opt-in and independent of the metadata collector. Only owned
     // screen cells cross this channel; the !Send VT parser stays on its worker.
     let (preview_requests, preview_work) = mpsc::sync_channel::<(u64, String, Session, String)>(1);
@@ -707,7 +753,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
     let mut preview_busy = false;
     let mut next_preview = Instant::now();
     let mut destination = None;
-    let mut pending_binding = None;
+    let mut focus_query: Option<mpsc::Receiver<FocusResult>> = None;
     type PaneQuery = (
         Session,
         std::result::Result<Vec<navigation::GhosttyTerminal>, String>,
@@ -722,6 +768,34 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
     while running.load(Ordering::SeqCst) {
         if terminal_disconnected()? {
             break;
+        }
+        if let Some(result) = focus_query.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            focus_query = None;
+            redraw = true;
+            // A collector started before binding save/rollback must not put
+            // the old navigation target back into the UI.
+            discard_refresh = app.refreshing;
+            if !app.refreshing && requests.try_send(()).is_ok() {
+                app.refreshing = true;
+                last_request = Instant::now();
+            }
+            app.notice = Some(match result {
+                Ok(binding) => {
+                    if let Some(binding) = binding {
+                        for session in app.snapshots.iter_mut().flat_map(|s| &mut s.sessions) {
+                            if session.host == binding.host
+                                && session.id == binding.session_id
+                                && session.pid == Some(binding.pid)
+                                && session.process_started_at == Some(binding.process_started_at)
+                            {
+                                session.target = Some(binding.target.clone());
+                            }
+                        }
+                    }
+                    "Focused Ghostty. TTYbird stays open here; q quits.".into()
+                }
+                Err(error) => format!("Cannot focus terminal: {}", clean(&error)),
+            });
         }
         if let Some((key, receiver)) = conversation_query.as_ref()
             && let Ok(result) = receiver.try_recv()
@@ -768,6 +842,14 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
         while let Ok(result) = ready.try_recv() {
             redraw = true;
             app.refreshing = false;
+            if discard_refresh {
+                discard_refresh = false;
+                if requests.try_send(()).is_ok() {
+                    app.refreshing = true;
+                    last_request = Instant::now();
+                }
+                continue;
+            }
             match result {
                 Ok(snapshots) => app.set_snapshots(snapshots),
                 Err(error) => {
@@ -947,9 +1029,14 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
                     if let Some((session, terminal_id)) = choice {
                         match bind_picker_session(cli, dir, &session, &terminal_id) {
                             Ok(pending) => {
-                                pending_binding = Some(pending);
-                                destination = Some((session.id, None));
-                                break;
+                                app.ghostty_picker = None;
+                                app.notice = Some("Focusing Ghostty…".into());
+                                focus_query = Some(focus_ghostty_from_dashboard(
+                                    cli,
+                                    dir,
+                                    session.id,
+                                    Some(pending),
+                                ));
                             }
                             Err(error) => {
                                 app.ghostty_picker = None;
@@ -1129,6 +1216,10 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
                 }
             }
             KeyCode::Enter => {
+                if focus_query.is_some() {
+                    app.notice = Some("A terminal focus request is still running.".into());
+                    continue;
+                }
                 if let Some(session) = app.selected_session().cloned() {
                     if session.target.is_none() {
                         let is_local = app.snapshots.first().is_some_and(|snapshot| {
@@ -1159,8 +1250,15 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
                         let local_host = app.snapshots.first().map(|s| s.host.as_str());
                         let host = (local_host != Some(session.host.as_str()))
                             .then_some(session.host.clone());
-                        destination = Some((session.id, host));
-                        break;
+                        if host.is_none() && matches!(session.target, Some(Target::Ghostty { .. }))
+                        {
+                            app.notice = Some("Focusing Ghostty…".into());
+                            focus_query =
+                                Some(focus_ghostty_from_dashboard(cli, dir, session.id, None));
+                        } else {
+                            destination = Some((session.id, host));
+                            break;
+                        }
                     }
                 }
             }
@@ -1173,14 +1271,13 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
     drop(preview_ready);
     drop(terminal);
     drop(guard);
-    if let Some((id, host)) = destination
-        && let Err(error) = focus(cli, dir, &id, &host)
-    {
-        if let Some(pending) = pending_binding {
-            rollback_picker_binding(dir, &pending)
-                .context("focus failed and binding rollback failed")?;
-        }
-        return Err(error);
+    // Do not abandon the bounded AppleScript helper or a pending binding
+    // rollback when q, Ctrl-C or terminal hangup occurs during navigation.
+    if let Some(receiver) = focus_query {
+        let _ = receiver.recv();
+    }
+    if let Some((id, host)) = destination {
+        focus(cli, dir, &id, &host)?;
     }
     Ok(())
 }

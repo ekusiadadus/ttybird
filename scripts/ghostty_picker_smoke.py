@@ -82,6 +82,7 @@ def main():
         result_path = os.path.join(root, "terminal-result.json")
         bindings_path = os.path.join(root, "bindings.json")
         focus_path = os.path.join(root, "focused-uuid")
+        fail_focus_path = os.path.join(root, "fail-focus")
         try:
             for directory in ("empty-codex", "empty-claude", "fake-bin"):
                 os.makedirs(os.path.join(root, directory))
@@ -104,6 +105,7 @@ def main():
             stub_path = os.path.join(root, "fake-bin", "osascript")
             stub = f'''#!/usr/bin/env python3
 import json
+import os
 import sys
 
 if "JavaScript" in sys.argv:
@@ -113,6 +115,9 @@ if "JavaScript" in sys.argv:
     ]))
     raise SystemExit(0)
 if "AppleScript" in sys.argv and sys.argv[-1] in ({FIRST_UUID!r}, {SECOND_UUID!r}):
+    if os.path.exists({fail_focus_path!r}):
+        print("synthetic focus failure", file=sys.stderr)
+        raise SystemExit(1)
     with open({focus_path!r}, "a", encoding="utf-8") as file:
         file.write(sys.argv[-1] + "\\n")
     raise SystemExit(0)
@@ -242,7 +247,7 @@ sys.exit(code)
                     if dashboard.poll() is not None:
                         break
                     drain(0.1)
-                assert marker in output, "expected dashboard state was not rendered"
+                assert marker in output, f"expected dashboard marker {marker!r} was not rendered"
 
             wait_for(b"TTYbird")
             os.write(master, ("/" + os.path.basename(root)).encode())
@@ -334,17 +339,23 @@ sys.exit(code)
             output.clear()
             os.write(master, b"\r")
             wait_for(b"Choose Ghostty pane")
+            # Failed transport must roll back the new mapping without exiting.
+            open(fail_focus_path, "w").close()
+            output.clear()
             os.write(master, b"\x1b[B\r")
-
-            deadline = time.monotonic() + 10
-            while dashboard.poll() is None and time.monotonic() < deadline:
-                drain(0.05)
-            assert dashboard.poll() == 0, "dashboard did not exit cleanly after explicit choice"
-            drain(0.1)
-
-            terminal_result = json.load(open(result_path, encoding="utf-8"))
-            assert terminal_result == {"exit": 0, "restored": True}, terminal_result
-            assert b"\x1b[?1049l" in output, "alternate screen was not restored"
+            # The terminal renderer may split changed text into cursor-addressed
+            # runs. Wait for the distinctive failure suffix, not the whole line.
+            wait_for(b"unsuccessfully")
+            assert dashboard.poll() is None, "failed focus closed the dashboard"
+            assert read_bindings(bindings_path) == [], "failed focus retained the new binding"
+            os.unlink(fail_focus_path)
+            output.clear()
+            os.write(master, b"\r")
+            wait_for(b"Choose Ghostty pane")
+            os.write(master, b"\x1b[B\r")
+            wait_for(b"TTYbird stays open")
+            assert dashboard.poll() is None, "focus closed the dashboard"
+            assert b"\x1b[?1049l" not in output, "focus left the alternate screen"
 
             bindings = read_bindings(bindings_path)
             assert len(bindings) == 1, "explicit choice did not create exactly one binding"
@@ -363,6 +374,25 @@ sys.exit(code)
                 focused = file.read().splitlines()
             assert focused == [SECOND_UUID], "focus did not receive exactly the chosen UUID"
 
+            # A second Enter follows the saved mapping and keeps the TUI alive.
+            output.clear()
+            os.write(master, b"\r")
+            wait_for(b"TTYbird stays open")
+            assert dashboard.poll() is None, "saved binding focus closed the dashboard"
+            with open(focus_path, encoding="utf-8") as file:
+                assert file.read().splitlines() == [SECOND_UUID, SECOND_UUID]
+
+            output.clear()
+            os.write(master, b"q")
+            deadline = time.monotonic() + 10
+            while dashboard.poll() is None and time.monotonic() < deadline:
+                drain(0.05)
+            assert dashboard.poll() == 0, "q did not close the dashboard after focusing"
+            drain(0.1)
+            terminal_result = json.load(open(result_path, encoding="utf-8"))
+            assert terminal_result == {"exit": 0, "restored": True}, terminal_result
+            assert b"\x1b[?1049l" in output, "q did not restore the alternate screen"
+
             print(
                 json.dumps(
                     {
@@ -372,7 +402,9 @@ sys.exit(code)
                         "stale_picker_rejected_without_binding": True,
                         "stale_picker_focus_calls": 0,
                         "explicit_second_uuid_bound": True,
-                        "fake_focus_called_once": True,
+                        "fake_focus_calls": 2,
+                        "dashboard_survived_picker_and_saved_focus": True,
+                        "failed_focus_rolled_back_and_kept_dashboard": True,
                         "terminal_restored": True,
                         "exit": 0,
                     }
