@@ -198,7 +198,7 @@ def exercise_hangup(ignore_sighup, close_delay):
                 code = process.wait(timeout=2)
             except subprocess.TimeoutExpired as error:
                 raise AssertionError('dashboard survived PTY hangup') from error
-            assert code == 0, f'dashboard did not handle PTY hangup cleanly: {code}'
+            assert code == 0, f'dashboard did not handle PTY hangup cleanly: exit={code}, ignore_sighup={ignore_sighup}, delay_ms={round(close_delay*1000)}'
             try:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:

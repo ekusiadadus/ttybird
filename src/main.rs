@@ -504,6 +504,36 @@ fn focus(cli: &Cli, dir: &std::path::Path, id: &str, host: &Option<String>) -> R
     navigation::focus(target)
 }
 
+/// Ratatui's `Terminal` destructor tries to show a cursor it previously hid.
+/// On a revoked PTY that write fails, and Ratatui then reports the failure with
+/// `eprintln!` to the same PTY, which can panic. Treat only confirmed terminal
+/// disappearance as a successful no-op; every other output error still matters.
+struct HangupSafeWriter<W> {
+    inner: W,
+}
+
+impl<W> HangupSafeWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write> Write for HangupSafeWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buffer) {
+            Err(error) if terminal_gone_error(&error) => Ok(buffer.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.flush() {
+            Err(error) if terminal_gone_error(&error) => Ok(()),
+            result => result,
+        }
+    }
+}
+
 struct ScreenGuard {
     #[cfg(unix)]
     input_flags: libc::c_int,
@@ -634,7 +664,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
     let signal = running.clone();
     ctrlc::set_handler(move || signal.store(false, Ordering::SeqCst))?;
     let guard = ScreenGuard::enter()?;
-    let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+    let backend = ratatui::backend::CrosstermBackend::new(HangupSafeWriter::new(io::stdout()));
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut app = ttybird::ui::App {
         needs_only: needs_me,
