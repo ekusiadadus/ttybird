@@ -31,7 +31,7 @@ JSON.stringify(app.terminals().map(term => ({
 })));
 "#;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GHOSTTY_FOCUS_APPLESCRIPT: &str = r#"
 on run argv
     if (count of argv) is not 1 then error "expected one terminal id"
