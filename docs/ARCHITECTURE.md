@@ -24,7 +24,7 @@ Every session includes provider, stable provider ID when available, explicit par
 
 Process presence does not establish an active model turn. An open transcript proves a process has the file open, not that every retained thread is busy. Head/tail samples can omit transitions. Codex model metadata has a separate bounded 4 MiB lookback when the sampled tail has no model record; exhausted lookback produces an unknown model. Live writable-descriptor-owned logs remain eligible outside the recent-history cutoff, subject to the global file/walk limits. Hook states expire after five minutes. History without a live association remains `log only`.
 
-Session IDs and tree links are scoped by host and provider in the aggregated view. The TUI traverses parent-child edges in depth-first order, guards cycles, and stores folds by stable session key. Folding only changes visibility; it does not interrupt agents. Search and attention filtering can reveal descendants. Clearing a filter restores the same selection or its closest visible ancestor where available. Navigation validates the current process identity. Ghostty bindings use exact surface UUIDs; working directory matching is deliberately insufficient. tmux uses socket and pane identity with TTY association. A child without its own terminal is not presented as having an independent shell.
+Session IDs and tree links are scoped by host and provider in the aggregated view. The TUI traverses parent-child edges in depth-first order, guards cycles, and stores folds by stable session key. Folding only changes visibility; it does not interrupt agents. Search and attention filtering can reveal folded descendants. Retained children with idle, ended or unknown activity remain hidden until `b` is enabled; filtering does not turn uncertain activity into a live-work claim. Clearing a filter restores the same selection or its closest visible ancestor where available. Navigation validates the current process identity. Ghostty bindings use exact surface UUIDs; working directory matching is deliberately insufficient. tmux uses socket and pane identity with TTY association. A child without its own terminal is not presented as having an independent shell.
 
 ## Interfaces
 
@@ -58,3 +58,14 @@ The Rust binding and sys crate are fixed at 0.2.1. The sys crate pins Ghostty `a
 `src/providers.rs` recognizes 16 provider identities using exact native executable names and documented Node/Bun/Python script paths. It parses the interpreter's actual script position; arbitrary prompts and later arguments cannot identify a provider. A single absolute-path canonicalization handles npm/Homebrew symlink entrypoints. Relative paths are not resolved against the collector's cwd. Ambiguous names such as `agent`, `goose`, and `pi` require additional install/invocation evidence.
 
 Only Codex/Claude opt into descriptor inspection and provider log sampling. Other providers contribute process metadata with unknown activity and no inferred model or parent session. The same explicit navigation and local tmux preview checks apply to every provider. The provider enum accepts unknown future values without inventing provider-specific capabilities. The CLI capability catalog and display labels use the shared provider definition.
+
+## Dashboard shutdown
+
+The dashboard checks stdin/stdout hangup/error readiness before and after each
+bounded input wait. Crossterm 0.28 uses its `use-dev-tty` Unix backend: the default
+Mio backend can loop inside `read` forever after PTY EOF, preventing both its
+poll timeout and the application termination flag from being checked. Switching
+backends and checking hangup are both required; a pre-poll check alone races
+closure during the wait. The dashboard redraws on input, resize and state updates,
+not on every idle poll. PTY fixtures own a dedicated process group and clean it
+on failure as well as success.

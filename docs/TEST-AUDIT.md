@@ -1,6 +1,6 @@
 # Test audit
 
-Baseline scope: 85 Rust tests in the collector/UI/CLI/navigation modules and integration tests, plus four smoke scripts. The native VT/capture tests were audited separately and are inventoried below. The integrated result is 76 ordinary tests plus the explicit private tmux test. Local checks passed; this is not a claim of lower test runtime.
+Baseline scope: 85 Rust tests in the collector/UI/CLI/navigation modules and integration tests, plus four smoke scripts. The native VT/capture tests were audited separately and are inventoried below. At that audit, the integrated result was 76 ordinary tests plus the explicit private tmux test. Local checks passed; this is not a claim of lower test runtime.
 
 Decision rule: a test earns its cost only when removing it would let a plausible user-visible, safety, compatibility, or resource-lifecycle regression pass. **Merge** means retain the behavior assertion while deleting the standalone test after moving it into the named neighboring test. **Delete/replace** means the current assertion does not independently protect a useful behavior; a replacement may still be called for.
 
@@ -137,7 +137,7 @@ process while its picker is open and verifies zero binding writes/focus calls.
 - `scripts/ghostty_picker_smoke.py` (`main`) — strongest wrong-focus coverage today: proves no implicit cwd binding, cancel is side-effect free, and the explicitly selected second UUID alone is saved/focused. Keep in release/local smoke; add the stale-picker branch described above.
 - `scripts/liveness_smoke.py` (`main`) — uniquely exercises real OS PID/start/TTY, descriptor closure, zombie exclusion, reap, and PTY hangup with a synthetic binary. Keep despite compiler/process cost; it catches failures unit fixtures cannot.
 - `scripts/tmux_preview_smoke.py` (top-level scenario) — proves the installed TUI opens/closes/reopens a real private-tmux preview and restores terminal attributes. Keep as an explicit smoke, sharing PTY helpers with `tui_smoke.py` if maintenance becomes costly.
-- `scripts/tui_smoke.py` (`exercise` over `keys`, `ctrl-c`, `signal`) — uniquely checks terminal restoration for normal quit, Ctrl-C, and SIGTERM plus basic interactive routing. Keep all three exit modes; each exercises a distinct cleanup path.
+- `scripts/tui_smoke.py` — checks restoration for normal quit, Ctrl-C, SIGTERM and a truncated input sequence followed by SIGTERM. Dashboard PTY-hangup cases exercise both initially ignored/default SIGHUP and closure before/during timed polling. These catch the observed detached-dashboard CPU loop; hanging up a fake agent in `liveness_smoke.py` did not cover it. Restoration compares configurable termios and mutable status flags, not kernel bookkeeping bits. Cleanup owns the fixture process group until its final signal and reaps the leader.
 
 ## Merge, then delete the standalone test
 
@@ -313,3 +313,24 @@ Result: 2 boundary tests became 3 because complete screen framing was previously
 Consolidation reduces repeated fixtures and maintenance; no execution-time
 speedup is claimed without measurements. Unresolved integration gaps above are
 not implied to be covered by unit tests or parser-library guarantees.
+
+## Session-insights regression boundaries (2026-09-16)
+
+- `collect`: cumulative Codex snapshots must not be summed; a missing tail total
+  after a sample gap must not reuse an obsolete head total. Optional zero and
+  missing fields remain different. Claude streaming updates must not count the
+  same message twice or claim a complete session total.
+- `collect`: bounded conversation extraction accepts only user/assistant text;
+  identity checks refuse an unidentified Claude sidechain. The recording exercises
+  the real local PID/start-time/writable-log read path with synthetic text.
+- `model`: old remote snapshots still deserialize; collection-only transcript
+  paths must not enter JSON.
+- `ui`: hiding auxiliary process rows must not copy their navigation targets;
+  titles stay searchable, sampled usage is labeled, and invalidation clears text.
+- `preview`: oversized APC input must not hide subsequent visible text. This
+  extends the existing side-effect-control regression rather than duplicating it.
+
+The public recording is also a bounded end-to-end scenario: discovery, tree
+actions, explicit conversation, native VT preview, and exact private-tmux focus.
+Its isolated inventory and text checks prevent real-session data from leaking
+into public media. It does not measure model performance or prove GUI focus.

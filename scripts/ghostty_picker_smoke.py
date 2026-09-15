@@ -46,6 +46,24 @@ def terminate(process):
         process.wait(timeout=5)
 
 
+def terminate_owned_group(process):
+    """Stop every process in the dashboard's fixture-only session."""
+    if process is None or process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    # Keep the leader unreaped until after the final group signal, preventing
+    # its PID from being reused as an unrelated process-group ID.
+    time.sleep(0.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait(timeout=2)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: ghostty_picker_smoke.py PATH_TO_TTYBIRD")
@@ -62,7 +80,6 @@ def main():
         master = slave = None
         output = bytearray()
         result_path = os.path.join(root, "terminal-result.json")
-        pid_path = os.path.join(root, "dashboard.pid")
         bindings_path = os.path.join(root, "bindings.json")
         focus_path = os.path.join(root, "focused-uuid")
         try:
@@ -163,12 +180,28 @@ raise SystemExit(64)
                 os.setsid()
                 fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
-            wrapper = '''import json,subprocess,sys,termios
+            wrapper = '''import fcntl,json,os,signal,subprocess,sys,termios
+state=getattr(termios,'PENDIN',0)
+mutable=0
+for name in ('O_APPEND','O_ASYNC','O_SYNC','O_DSYNC','O_NONBLOCK'): mutable|=getattr(os,name,0)
+mutable|=os.O_ACCMODE
+def comparable(value): return value[:3]+[value[3]&~state]+value[4:]
 before=termios.tcgetattr(0)
-p=subprocess.Popen(sys.argv[3:])
-open(sys.argv[1],'w').write(str(p.pid))
-code=p.wait()
-json.dump({'exit':code,'restored':before==termios.tcgetattr(0)},open(sys.argv[2],'w'))
+flags=fcntl.fcntl(0,fcntl.F_GETFL)
+p=None
+def forward(signum,frame):
+    if p is not None:
+        try: p.send_signal(signum)
+        except ProcessLookupError: pass
+for signum in (signal.SIGHUP,signal.SIGTERM): signal.signal(signum,forward)
+try:
+    p=subprocess.Popen(sys.argv[2:])
+    code=p.wait()
+finally:
+    if p is not None and p.poll() is None:
+        p.kill();p.wait()
+restored=comparable(before)==comparable(termios.tcgetattr(0)) and flags&mutable==fcntl.fcntl(0,fcntl.F_GETFL)&mutable
+json.dump({'exit':code,'restored':restored},open(sys.argv[1],'w'))
 sys.exit(code)
 '''
             dashboard = subprocess.Popen(
@@ -176,7 +209,6 @@ sys.exit(code)
                     sys.executable,
                     "-c",
                     wrapper,
-                    pid_path,
                     result_path,
                     binary,
                     "--local",
@@ -259,6 +291,8 @@ sys.exit(code)
             os.close(master)
             os.close(slave)
             master = slave = None
+            terminate_owned_group(dashboard)
+            dashboard = None
 
             fixture = subprocess.Popen(
                 [node, entry],
@@ -277,7 +311,6 @@ sys.exit(code)
                     sys.executable,
                     "-c",
                     wrapper,
-                    pid_path,
                     result_path,
                     binary,
                     "--local",
@@ -346,12 +379,7 @@ sys.exit(code)
                 )
             )
         finally:
-            if dashboard is not None and dashboard.poll() is None and os.path.exists(pid_path):
-                try:
-                    os.kill(int(open(pid_path, encoding="utf-8").read()), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, ValueError):
-                    pass
-            terminate(dashboard)
+            terminate_owned_group(dashboard)
             for fd in (master, slave):
                 if fd is not None:
                     os.close(fd)

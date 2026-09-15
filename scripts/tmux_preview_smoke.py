@@ -27,6 +27,24 @@ def tmux(*args):
     return subprocess.check_output(['tmux', '-L', server, *args], stderr=subprocess.PIPE)
 
 
+def terminate_owned_group(process):
+    """Stop every process in the fixture-only session and reap its leader."""
+    if process is None or process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    # Keep the leader unreaped so its PID cannot be reused as another group's
+    # ID before the final fixture-group signal.
+    time.sleep(.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait(timeout=2)
+
+
 with tempfile.TemporaryDirectory(prefix='ttybird-synthetic-preview-') as root:
     process = None
     master = slave = None
@@ -64,11 +82,28 @@ with tempfile.TemporaryDirectory(prefix='ttybird-synthetic-preview-') as root:
             os.setsid()
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
         result_path = root + '/terminal-result.json'
-        wrapper = '''import json,subprocess,sys,termios
+        wrapper = '''import fcntl,json,os,signal,subprocess,sys,termios
+state=getattr(termios,'PENDIN',0)
+mutable=0
+for name in ('O_APPEND','O_ASYNC','O_SYNC','O_DSYNC','O_NONBLOCK'): mutable|=getattr(os,name,0)
+mutable|=os.O_ACCMODE
+def comparable(value): return value[:3]+[value[3]&~state]+value[4:]
 before=termios.tcgetattr(0)
-p=subprocess.Popen(sys.argv[2:])
-code=p.wait()
-json.dump({'exit':code,'restored':before==termios.tcgetattr(0)},open(sys.argv[1],'w'))
+flags=fcntl.fcntl(0,fcntl.F_GETFL)
+p=None
+def forward(signum,frame):
+    if p is not None:
+        try: p.send_signal(signum)
+        except ProcessLookupError: pass
+for signum in (signal.SIGHUP,signal.SIGTERM): signal.signal(signum,forward)
+try:
+    p=subprocess.Popen(sys.argv[2:])
+    code=p.wait()
+finally:
+    if p is not None and p.poll() is None:
+        p.kill();p.wait()
+restored=comparable(before)==comparable(termios.tcgetattr(0)) and flags&mutable==fcntl.fcntl(0,fcntl.F_GETFL)&mutable
+json.dump({'exit':code,'restored':restored},open(sys.argv[1],'w'))
 sys.exit(code)
 '''
         process = subprocess.Popen([sys.executable, '-c', wrapper, result_path, binary,
@@ -119,12 +154,7 @@ sys.exit(code)
                           'close_and_reopen_rendered': True,
                           'terminal_restored': True, 'exit': 0}))
     finally:
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-                pass
+        terminate_owned_group(process)
         for fd in (master, slave):
             if fd is not None:
                 os.close(fd)

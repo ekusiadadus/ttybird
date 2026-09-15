@@ -15,7 +15,10 @@ use sysinfo::{
 use walkdir::WalkDir;
 
 use crate::{
-    model::{Activity, Confidence, Provider, Session, Snapshot},
+    model::{
+        Activity, Confidence, Provider, Session, SessionInsights, Snapshot, TokenUsage,
+        TokenUsageScope,
+    },
     providers,
     remote::run_bounded,
 };
@@ -23,8 +26,11 @@ use crate::{
 const HEAD_BYTES: u64 = 256 * 1024;
 const TAIL_BYTES: u64 = 512 * 1024;
 const MODEL_LOOKBACK_BYTES: u64 = 4 * 1024 * 1024;
+const INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_ENTRIES: usize = 50_000;
 const LIVE_STATE_FRESHNESS_SECONDS: i64 = 5 * 60;
+const RECENT_CONVERSATION_MESSAGES: usize = 3;
+const RECENT_MESSAGE_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone)]
 pub struct CollectOptions {
@@ -60,6 +66,7 @@ struct LiveProcess {
     cwd: Option<String>,
     headless: bool,
     open_files: HashSet<PathBuf>,
+    open_files_complete: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +94,8 @@ struct ParsedLog {
     state: LogState,
     state_at: Option<i64>,
     omit_unidentified_child: bool,
+    title: Option<String>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +166,16 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
     scan.logs.reverse();
     scan.logs.truncate(options.max_logs);
 
+    let codex_titles = match load_codex_titles(&options.codex_home.join("session_index.jsonl")) {
+        Ok(titles) => titles,
+        Err(_) => {
+            snapshot
+                .warnings
+                .push("could not read the bounded Codex title index".to_owned());
+            HashMap::new()
+        }
+    };
+
     let mut represented_processes = HashSet::new();
     let mut parse_errors = 0usize;
     let mut omitted_claude_children = 0usize;
@@ -184,6 +203,15 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
             (0..=LIVE_STATE_FRESHNESS_SECONDS)
                 .contains(&snapshot.collected_at.saturating_sub(timestamp))
         });
+        let insights = SessionInsights {
+            title: if log.provider == Provider::Codex {
+                codex_titles.get(&id).cloned().or(parsed.title)
+            } else {
+                parsed.title
+            },
+            usage: parsed.usage,
+            log_path: Some(log.path.clone()),
+        };
         snapshot.sessions.push(Session {
             id,
             provider: log.provider,
@@ -205,6 +233,7 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
             },
             updated_at: Some(log.modified_at),
             target: None,
+            insights,
         });
     }
     if parse_errors > 0 {
@@ -244,6 +273,7 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
             },
             updated_at: None,
             target: None,
+            insights: SessionInsights::default(),
         });
     }
 
@@ -255,6 +285,163 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(snapshot)
+}
+
+/// Read a small plaintext conversation excerpt only after revalidating the
+/// exact live process and its uniquely owned writable transcript descriptor.
+/// The returned text is intended for an explicit local UI action and is never
+/// stored in [`Session`] or serialized in snapshots.
+pub fn recent_conversation(session: &Session) -> Result<String> {
+    let Some(pid) = session.pid else {
+        anyhow::bail!("conversation preview requires a live session");
+    };
+    let Some(started_at) = session.process_started_at else {
+        anyhow::bail!("conversation preview requires a verified process identity");
+    };
+    let Some(stored_path) = session.insights.log_path.as_ref() else {
+        anyhow::bail!("conversation transcript is unavailable");
+    };
+    if !matches!(session.provider, Provider::Codex | Provider::Claude) {
+        anyhow::bail!("conversation preview is unavailable for this provider");
+    }
+
+    let path =
+        fs::canonicalize(stored_path).with_context(|| "revalidate the conversation transcript")?;
+    let (processes, _) = live_processes();
+    verify_conversation_owner(&processes, session, &path)?;
+
+    // Keep one descriptor for identity and content so a path replacement cannot
+    // make the metadata check and bounded read observe different files.
+    let mut file = File::open(&path).with_context(|| "open the conversation transcript")?;
+    if !open_file_matches_path(&file, &path)? {
+        anyhow::bail!("conversation transcript path changed before the read");
+    }
+    if session_id_from_head(&mut file, session.provider)?.as_deref() != Some(session.id.as_str()) {
+        anyhow::bail!("conversation transcript identity changed");
+    }
+
+    let lines = bounded_tail_lines(&mut file, TAIL_BYTES)?;
+    if !open_file_matches_path(&file, &path)? {
+        anyhow::bail!("conversation transcript path changed during the read");
+    }
+    let refreshed_path = fs::canonicalize(stored_path)
+        .with_context(|| "revalidate the conversation transcript after reading")?;
+    if refreshed_path != path {
+        anyhow::bail!("conversation transcript path changed during the read");
+    }
+    let (refreshed_processes, _) = live_processes();
+    verify_conversation_owner(&refreshed_processes, session, &path)?;
+    if !open_file_matches_path(&file, &path)? {
+        anyhow::bail!("conversation transcript path changed during revalidation");
+    }
+    if process_identity(pid) != Some(started_at) {
+        anyhow::bail!("conversation process identity changed during the read");
+    }
+    let messages = recent_plaintext_messages(session.provider, lines);
+    if messages.is_empty() {
+        anyhow::bail!("no recent plaintext conversation is available");
+    }
+    Ok(messages
+        .into_iter()
+        .map(|(role, text)| format!("{role}: {text}"))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn verify_conversation_owner(
+    processes: &[LiveProcess],
+    session: &Session,
+    path: &Path,
+) -> Result<()> {
+    let pid = session
+        .pid
+        .context("conversation preview requires a live session")?;
+    let started_at = session
+        .process_started_at
+        .context("conversation preview requires a verified process identity")?;
+    if processes
+        .iter()
+        .any(|process| process.provider == session.provider && !process.open_files_complete)
+    {
+        anyhow::bail!("conversation ownership could not be fully revalidated");
+    }
+    let matches: Vec<_> = processes
+        .iter()
+        .enumerate()
+        .filter(|(_, process)| {
+            process.pid == pid
+                && process.started_at == started_at
+                && process.provider == session.provider
+        })
+        .collect();
+    if matches.len() != 1 {
+        anyhow::bail!("conversation process identity changed");
+    }
+    let owners = unique_process_file_map(processes);
+    if owners.get(path) != Some(&(matches[0].0, session.provider)) {
+        anyhow::bail!("conversation transcript is not uniquely owned by the session");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_matches_path(file: &File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let open = file.metadata()?;
+    let current = fs::metadata(path)?;
+    Ok(open.dev() == current.dev() && open.ino() == current.ino())
+}
+
+#[cfg(not(unix))]
+fn open_file_matches_path(_file: &File, _path: &Path) -> Result<bool> {
+    // Windows does not expose a stable std file identity. The single open
+    // descriptor plus post-read canonical path/ownership checks still apply.
+    Ok(true)
+}
+
+fn session_id_from_head(file: &mut File, provider: Provider) -> Result<Option<String>> {
+    let length = file.metadata()?.len();
+    let head_end = length.min(HEAD_BYTES);
+    let lines = read_complete_range(file, 0, head_end, length)?;
+    Ok(match provider {
+        Provider::Codex => lines.into_iter().find_map(|line| {
+            let value = serde_json::from_slice::<Value>(&line).ok()?;
+            (value.get("type").and_then(Value::as_str) == Some("session_meta"))
+                .then(|| {
+                    value.get("payload").and_then(|payload| {
+                        string_at(payload, &["id"]).or_else(|| string_at(payload, &["session_id"]))
+                    })
+                })
+                .flatten()
+        }),
+        Provider::Claude => {
+            let mut session_id = None;
+            let mut agent_id = None;
+            let mut is_sidechain = false;
+            for line in lines {
+                let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
+                session_id = string_at(&value, &["sessionId"]).or(session_id);
+                agent_id = string_at(&value, &["agentId"]).or(agent_id);
+                is_sidechain |= value
+                    .get("isSidechain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            }
+            match (session_id, agent_id, is_sidechain) {
+                (Some(parent_id), Some(agent_id), _) => {
+                    Some(format!("{parent_id}:agent:{agent_id}"))
+                }
+                (Some(_), None, true) => None,
+                (session_id, None, false) => session_id,
+                (None, Some(_), _) => None,
+                (None, None, true) => None,
+            }
+        }
+        _ => None,
+    })
 }
 
 /// Remove process-only rows that died during sampling and detach historical logs.
@@ -364,16 +551,16 @@ fn live_processes() -> (Vec<LiveProcess>, Option<String>) {
         };
         let pid = pid.as_u32();
         let headless = providers::is_headless(provider, process.cmd());
-        let open_files = if providers::has_session_logs(provider) {
+        let (open_files, open_files_complete) = if providers::has_session_logs(provider) {
             match open_file_paths(pid) {
-                Ok(paths) => paths,
+                Ok(paths) => (paths, true),
                 Err(_) => {
                     descriptor_failures += 1;
-                    HashSet::new()
+                    (HashSet::new(), false)
                 }
             }
         } else {
-            HashSet::new()
+            (HashSet::new(), true)
         };
         result.push(LiveProcess {
             provider,
@@ -385,6 +572,7 @@ fn live_processes() -> (Vec<LiveProcess>, Option<String>) {
                 .map(|path| path.to_string_lossy().into_owned()),
             headless,
             open_files,
+            open_files_complete,
         });
     }
     let warning = (descriptor_failures > 0).then(|| {
@@ -644,6 +832,76 @@ fn codex_model(line: &[u8]) -> Option<String> {
         .flatten()
 }
 
+fn load_codex_titles(path: &Path) -> Result<HashMap<String, String>> {
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let mut file = File::open(path).with_context(|| "open the Codex title index")?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(INDEX_BYTES);
+    let lines = read_complete_range(&mut file, start, length - start, length)?;
+    let mut titles = HashMap::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = string_at(&value, &["id"]) else {
+            continue;
+        };
+        if let Some(title) = title_at(&value) {
+            titles.insert(id, title);
+        }
+    }
+    Ok(titles)
+}
+
+fn title_at(value: &Value) -> Option<String> {
+    ["custom_title", "customTitle", "thread_name", "title"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+        .and_then(bounded_title)
+}
+
+fn bounded_title(value: &str) -> Option<String> {
+    let title: String = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    (!title.is_empty()).then_some(title)
+}
+
+fn codex_total_usage(value: &Value) -> Option<TokenUsage> {
+    let total = value
+        .get("payload")?
+        .get("info")?
+        .get("total_token_usage")?;
+    let input_tokens = u64_at(total, "input_tokens")?;
+    let cached_input_tokens = u64_at(total, "cached_input_tokens");
+    let output_tokens = u64_at(total, "output_tokens")?;
+    let reasoning_output_tokens = u64_at(total, "reasoning_output_tokens");
+    let total_tokens = u64_at(total, "total_tokens")?;
+    if cached_input_tokens.is_some_and(|cached| cached > input_tokens)
+        || reasoning_output_tokens.is_some_and(|reasoning| reasoning > output_tokens)
+        || input_tokens.checked_add(output_tokens) != Some(total_tokens)
+    {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        scope: TokenUsageScope::Total,
+    })
+}
+
+fn u64_at(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
 fn bounded_lines(path: &Path) -> Result<SampledLines> {
     let mut file = File::open(path).with_context(|| "open a session log")?;
     let length = file.metadata()?.len();
@@ -666,6 +924,99 @@ fn bounded_lines(path: &Path) -> Result<SampledLines> {
         lines,
         tail_after_gap,
     })
+}
+
+fn bounded_tail_lines(file: &mut File, limit: u64) -> Result<Vec<Vec<u8>>> {
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(limit);
+    read_complete_range(file, start, length - start, length)
+}
+
+fn recent_plaintext_messages(
+    provider: Provider,
+    lines: Vec<Vec<u8>>,
+) -> Vec<(&'static str, String)> {
+    let mut messages = Vec::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let message = match provider {
+            Provider::Codex => codex_plaintext_message(&value),
+            Provider::Claude => claude_plaintext_message(&value),
+            _ => None,
+        };
+        if let Some(message) = message {
+            messages.push(message);
+            if messages.len() > RECENT_CONVERSATION_MESSAGES {
+                messages.remove(0);
+            }
+        }
+    }
+    messages
+}
+
+fn codex_plaintext_message(value: &Value) -> Option<(&'static str, String)> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let (role, block_type) = match payload.get("role").and_then(Value::as_str) {
+        Some("user") => ("User", "input_text"),
+        Some("assistant") => ("Assistant", "output_text"),
+        _ => return None,
+    };
+    plaintext_content(payload.get("content")?, block_type).map(|text| (role, text))
+}
+
+fn claude_plaintext_message(value: &Value) -> Option<(&'static str, String)> {
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let role = match value.get("type").and_then(Value::as_str) {
+        Some("user") => "User",
+        Some("assistant") => "Assistant",
+        _ => return None,
+    };
+    let message = value.get("message")?;
+    let message_role = message.get("role").and_then(Value::as_str)?;
+    if !matches!(
+        (role, message_role),
+        ("User", "user") | ("Assistant", "assistant")
+    ) {
+        return None;
+    }
+    plaintext_content(message.get("content")?, "text").map(|text| (role, text))
+}
+
+fn plaintext_content(value: &Value, allowed_block_type: &str) -> Option<String> {
+    let pieces: Vec<&str> = match value {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some(allowed_block_type))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => return None,
+    };
+    if pieces.is_empty() {
+        return None;
+    }
+    let joined = pieces.join("\n");
+    let text: String = joined
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '\n' | '\t' => character,
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .take(RECENT_MESSAGE_CHARS)
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 fn read_complete_range(
@@ -720,6 +1071,9 @@ fn parse_codex_sample(sample: SampledLines) -> ParsedLog {
         if sample.tail_after_gap == Some(index) {
             parsed.state = LogState::Unknown;
             parsed.state_at = None;
+            // Codex usage records are cumulative snapshots. A snapshot from
+            // before an unread gap is not the final session total.
+            parsed.usage = None;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
@@ -733,6 +1087,7 @@ fn parse_codex_sample(sample: SampledLines) -> ParsedLog {
                     .or_else(|| string_at(payload, &["session_id"]))
                     .or(parsed.id);
                 parsed.cwd = string_at(payload, &["cwd"]).or(parsed.cwd);
+                parsed.title = title_at(payload).or(parsed.title);
                 parsed.parent_id = string_at(payload, &["parent_thread_id"])
                     .or_else(|| {
                         string_at(
@@ -755,11 +1110,11 @@ fn parse_codex_sample(sample: SampledLines) -> ParsedLog {
                     .or(parsed.model);
             }
             Some("event_msg") => {
-                let state = match value
+                let event_type = value
                     .get("payload")
                     .and_then(|payload| payload.get("type"))
-                    .and_then(Value::as_str)
-                {
+                    .and_then(Value::as_str);
+                let state = match event_type {
                     Some("task_started") => Some(LogState::Started),
                     Some("task_complete") => Some(LogState::Completed),
                     Some("turn_aborted") => Some(LogState::Aborted),
@@ -768,6 +1123,13 @@ fn parse_codex_sample(sample: SampledLines) -> ParsedLog {
                 if let Some(state) = state {
                     parsed.state = state;
                     parsed.state_at = record_timestamp(&value);
+                }
+                if event_type == Some("token_count")
+                    && let Some(usage) = codex_total_usage(&value)
+                {
+                    // `total_token_usage` is already cumulative. Replacing it
+                    // avoids double-counting prompt-cache snapshots.
+                    parsed.usage = Some(usage);
                 }
             }
             _ => {}
@@ -788,6 +1150,7 @@ fn parse_claude_sample(sample: SampledLines) -> ParsedLog {
     let mut parsed = ParsedLog::default();
     let mut agent_id = None;
     let mut is_sidechain = false;
+    let mut message_usages = HashMap::new();
     for (index, line) in sample.lines.into_iter().enumerate() {
         if sample.tail_after_gap == Some(index) {
             parsed.state = LogState::Unknown;
@@ -804,6 +1167,9 @@ fn parse_claude_sample(sample: SampledLines) -> ParsedLog {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let kind = value.get("type").and_then(Value::as_str);
+        if kind == Some("custom-title") {
+            parsed.title = title_at(&value).or(parsed.title);
+        }
         if kind == Some("user") {
             parsed.state = LogState::ClaudeUser;
             parsed.state_at = record_timestamp(&value);
@@ -813,6 +1179,12 @@ fn parse_claude_sample(sample: SampledLines) -> ParsedLog {
             parsed.model = message
                 .and_then(|message| string_at(message, &["model"]))
                 .or(parsed.model);
+            if let Some((usage_id, item)) = claude_message_usage(&value) {
+                // Streaming/resume records may repeat the provider message ID.
+                // The newest snapshot replaces the older one; snapshots are
+                // never added together.
+                message_usages.insert(usage_id, item);
+            }
             parsed.state = match message
                 .and_then(|message| message.get("stop_reason"))
                 .and_then(Value::as_str)
@@ -833,7 +1205,109 @@ fn parse_claude_sample(sample: SampledLines) -> ParsedLog {
         parsed.id = None;
         parsed.omit_unidentified_child = true;
     }
+    let mut usage = UsageSum::default();
+    for item in message_usages.values() {
+        usage.add(item);
+    }
+    // Even a fully sampled transcript can omit usage for compaction/resume
+    // records, so Claude usage is never labelled as a provider total.
+    parsed.usage = usage.finish(TokenUsageScope::Sampled);
     parsed
+}
+
+#[derive(Debug, Default)]
+struct UsageSum {
+    input_tokens: u128,
+    cached_input_tokens: Option<u128>,
+    output_tokens: u128,
+    reasoning_output_tokens: Option<u128>,
+    total_tokens: u128,
+    observed: bool,
+}
+
+impl UsageSum {
+    fn add(&mut self, usage: &TokenUsage) {
+        self.input_tokens += u128::from(usage.input_tokens);
+        self.cached_input_tokens = match (
+            self.observed,
+            self.cached_input_tokens,
+            usage.cached_input_tokens,
+        ) {
+            (false, _, value) => value.map(u128::from),
+            (true, Some(total), Some(value)) => Some(total + u128::from(value)),
+            _ => None,
+        };
+        self.output_tokens += u128::from(usage.output_tokens);
+        self.reasoning_output_tokens = match (
+            self.observed,
+            self.reasoning_output_tokens,
+            usage.reasoning_output_tokens,
+        ) {
+            (false, _, value) => value.map(u128::from),
+            (true, Some(total), Some(value)) => Some(total + u128::from(value)),
+            _ => None,
+        };
+        self.total_tokens += u128::from(usage.total_tokens);
+        self.observed = true;
+    }
+
+    fn finish(self, scope: TokenUsageScope) -> Option<TokenUsage> {
+        if !self.observed {
+            return None;
+        }
+        Some(TokenUsage {
+            input_tokens: self.input_tokens.try_into().ok()?,
+            cached_input_tokens: self
+                .cached_input_tokens
+                .map(u64::try_from)
+                .transpose()
+                .ok()?,
+            output_tokens: self.output_tokens.try_into().ok()?,
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .map(u64::try_from)
+                .transpose()
+                .ok()?,
+            total_tokens: self.total_tokens.try_into().ok()?,
+            scope,
+        })
+    }
+}
+
+fn claude_message_usage(value: &Value) -> Option<(String, TokenUsage)> {
+    let message = value.get("message")?;
+    // Provider message IDs are stable across streaming transcript updates.
+    // A top-level transcript UUID identifies the record, not the API message,
+    // so records without `message.id` cannot be deduplicated reliably.
+    let usage_id = string_at(message, &["id"])?;
+    let usage = message.get("usage")?;
+    let base_input = u64_at(usage, "input_tokens")?;
+    let cache_creation = u64_at(usage, "cache_creation_input_tokens").unwrap_or(0);
+    let cache_read = u64_at(usage, "cache_read_input_tokens");
+    let input_tokens = base_input
+        .checked_add(cache_creation)?
+        .checked_add(cache_read.unwrap_or(0))?;
+    let output_tokens = u64_at(usage, "output_tokens")?;
+    let total_tokens = input_tokens.checked_add(output_tokens)?;
+    let reasoning_output_tokens = u64_at(usage, "thinking_tokens").or_else(|| {
+        usage
+            .get("output_tokens_details")
+            .and_then(|details| u64_at(details, "thinking_tokens"))
+    });
+    if reasoning_output_tokens.is_some_and(|reasoning| reasoning > output_tokens) {
+        return None;
+    }
+    Some((
+        usage_id,
+        TokenUsage {
+            input_tokens,
+            cached_input_tokens: cache_read,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            scope: TokenUsageScope::Sampled,
+        },
+    ))
 }
 
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
@@ -888,6 +1362,7 @@ mod tests {
                 "payload": {
                     "id": "session-1",
                     "cwd": "/work",
+                    "title": "Synthetic session",
                     "source": {"subagent": {"spawn": {"parent_thread_id": "parent-1"}}}
                 }
             }),
@@ -908,8 +1383,89 @@ mod tests {
         assert_eq!(parsed.parent_id.as_deref(), Some("parent-1"));
         assert_eq!(parsed.cwd.as_deref(), Some("/work"));
         assert_eq!(parsed.model.as_deref(), Some("gpt-test"));
+        assert_eq!(parsed.title.as_deref(), Some("Synthetic session"));
         assert_eq!(activity(parsed.state, true, true), Activity::Working);
         assert_eq!(activity(parsed.state, false, true), Activity::Unknown);
+    }
+
+    #[test]
+    fn codex_uses_latest_cumulative_usage_snapshot_without_summing() {
+        let parsed = parse_codex(vec![
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}"#.to_vec(),
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":175,"cached_input_tokens":70,"output_tokens":35,"reasoning_output_tokens":8,"total_tokens":210}}}}"#.to_vec(),
+        ]);
+        assert_eq!(
+            parsed.usage,
+            Some(TokenUsage {
+                input_tokens: 175,
+                cached_input_tokens: Some(70),
+                output_tokens: 35,
+                reasoning_output_tokens: Some(8),
+                total_tokens: 210,
+                scope: TokenUsageScope::Total,
+            })
+        );
+
+        let across_gap = parse_codex_sample(SampledLines {
+            lines: vec![
+                br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}"#.to_vec(),
+                br#"{"type":"event_msg","payload":{"type":"task_complete"}}"#.to_vec(),
+            ],
+            tail_after_gap: Some(1),
+        });
+        assert_eq!(across_gap.usage, None);
+    }
+
+    #[test]
+    fn codex_title_index_accepts_only_named_metadata_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session_index.jsonl");
+        let mut file = File::create(&path).unwrap();
+        line(
+            &mut file,
+            serde_json::json!({"id":"one","thread_name":" First title "}),
+        );
+        line(
+            &mut file,
+            serde_json::json!({"id":"one","custom_title":"Latest title"}),
+        );
+        line(
+            &mut file,
+            serde_json::json!({"id":"two","first_prompt":"must not become a title"}),
+        );
+        drop(file);
+
+        let titles = load_codex_titles(&path).unwrap();
+        assert_eq!(titles.get("one").map(String::as_str), Some("Latest title"));
+        assert!(!titles.contains_key("two"));
+    }
+
+    #[test]
+    fn optional_usage_fields_preserve_missing_and_explicit_zero() {
+        let missing = parse_codex(vec![
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#.to_vec(),
+        ])
+        .usage
+        .unwrap();
+        assert_eq!(missing.cached_input_tokens, None);
+        assert_eq!(missing.reasoning_output_tokens, None);
+
+        let explicit_zero = parse_codex(vec![
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12}}}}"#.to_vec(),
+        ])
+        .usage
+        .unwrap();
+        assert_eq!(explicit_zero.cached_input_tokens, Some(0));
+        assert_eq!(explicit_zero.reasoning_output_tokens, Some(0));
+
+        let sampled = parse_claude(vec![
+            br#"{"type":"assistant","sessionId":"claude-1","message":{"id":"message-1","usage":{"input_tokens":10,"cache_read_input_tokens":0,"output_tokens":2,"thinking_tokens":0}}}"#.to_vec(),
+            br#"{"type":"assistant","sessionId":"claude-1","message":{"id":"message-2","usage":{"input_tokens":20,"output_tokens":3}}}"#.to_vec(),
+        ])
+        .usage
+        .unwrap();
+        assert_eq!(sampled.cached_input_tokens, None);
+        assert_eq!(sampled.reasoning_output_tokens, None);
     }
 
     #[test]
@@ -1119,6 +1675,68 @@ mod tests {
     }
 
     #[test]
+    fn claude_custom_title_and_message_usage_are_bounded_and_deduplicated() {
+        let lines = vec![
+            br#"{"type":"custom-title","customTitle":"Release audit"}"#.to_vec(),
+            br#"{"type":"assistant","sessionId":"claude-1","uuid":"record-1","message":{"id":"message-1","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":5,"output_tokens":7,"thinking_tokens":2}}}"#.to_vec(),
+            br#"{"type":"assistant","sessionId":"claude-1","uuid":"duplicate-record","message":{"id":"message-1","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":12,"cache_creation_input_tokens":4,"cache_read_input_tokens":6,"output_tokens":8,"thinking_tokens":3}}}"#.to_vec(),
+            br#"{"type":"assistant","sessionId":"claude-1","uuid":"record-2","message":{"id":"message-2","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":20,"cache_read_input_tokens":4,"output_tokens":9,"output_tokens_details":{"thinking_tokens":3}}}}"#.to_vec(),
+        ];
+        let parsed = parse_claude(lines.clone());
+        assert_eq!(parsed.title.as_deref(), Some("Release audit"));
+        assert_eq!(
+            parsed.usage,
+            Some(TokenUsage {
+                input_tokens: 46,
+                cached_input_tokens: Some(10),
+                output_tokens: 17,
+                reasoning_output_tokens: Some(6),
+                total_tokens: 63,
+                scope: TokenUsageScope::Sampled,
+            })
+        );
+
+        let sampled = parse_claude_sample(SampledLines {
+            lines,
+            tail_after_gap: Some(2),
+        });
+        assert_eq!(
+            sampled.usage.as_ref().map(|usage| usage.scope),
+            Some(TokenUsageScope::Sampled)
+        );
+    }
+
+    #[test]
+    fn conversation_excerpt_keeps_only_recent_plaintext_messages() {
+        let lines = vec![
+            br#"{"type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"input_text","text":"hidden"}]}}"#.to_vec(),
+            br#"{"type":"response_item","payload":{"type":"function_call","arguments":"hidden tool args"}}"#.to_vec(),
+            br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}"#.to_vec(),
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"},{"type":"reasoning","text":"hidden reasoning"}]}}"#.to_vec(),
+            br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third"}]}}"#.to_vec(),
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fourth\u0007"}]}}"#.to_vec(),
+        ];
+        assert_eq!(
+            recent_plaintext_messages(Provider::Codex, lines),
+            vec![
+                ("Assistant", "second".to_owned()),
+                ("User", "third".to_owned()),
+                ("Assistant", "fourth ".to_owned()),
+            ]
+        );
+
+        let claude = recent_plaintext_messages(
+            Provider::Claude,
+            vec![
+                br#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"hidden"}]}}"#.to_vec(),
+                br#"{"type":"user","isMeta":true,"message":{"role":"user","content":"hidden metadata"}}"#.to_vec(),
+                br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"visible"}]}}"#.to_vec(),
+            ],
+        );
+        assert_eq!(claude, vec![("Assistant", "visible".to_owned())]);
+    }
+
+    #[test]
     fn shared_open_file_is_not_assigned_arbitrarily() {
         let shared = PathBuf::from("/tmp/shared.jsonl");
         let process = |pid| LiveProcess {
@@ -1129,9 +1747,66 @@ mod tests {
             cwd: None,
             headless: false,
             open_files: HashSet::from([shared.clone()]),
+            open_files_complete: true,
         };
         let map = unique_process_file_map(&[process(1), process(2)]);
         assert!(!map.contains_key(&shared));
+    }
+
+    #[test]
+    fn incomplete_provider_descriptor_census_rejects_conversation_ownership() {
+        let path = PathBuf::from("/tmp/session.jsonl");
+        let owner = LiveProcess {
+            provider: Provider::Codex,
+            pid: 7,
+            started_at: 11,
+            tty: None,
+            cwd: None,
+            headless: false,
+            open_files: HashSet::from([path.clone()]),
+            open_files_complete: true,
+        };
+        let mut uninspected = owner.clone();
+        uninspected.pid = 8;
+        uninspected.open_files.clear();
+        uninspected.open_files_complete = false;
+        let session = Session {
+            id: "session".into(),
+            provider: Provider::Codex,
+            parent_id: None,
+            host: "local".into(),
+            pid: Some(7),
+            process_started_at: Some(11),
+            tty: None,
+            cwd: None,
+            model: None,
+            activity: Activity::Unknown,
+            confidence: Confidence::Inferred,
+            evidence: String::new(),
+            updated_at: None,
+            target: None,
+            insights: SessionInsights::default(),
+        };
+
+        let error = verify_conversation_owner(&[owner, uninspected], &session, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not be fully revalidated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_conversation_file_rejects_a_replaced_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        File::create(&path).unwrap();
+        let open = File::open(&path).unwrap();
+        assert!(open_file_matches_path(&open, &path).unwrap());
+
+        fs::rename(&path, dir.path().join("previous.jsonl")).unwrap();
+        File::create(&path).unwrap();
+
+        assert!(!open_file_matches_path(&open, &path).unwrap());
     }
 
     #[test]

@@ -114,6 +114,7 @@ fn check_capture(alternate: bool) {
         tty: Some(tty.into()),
         cwd: None,
         model: None,
+        insights: Default::default(),
         activity: Activity::Unknown,
         confidence: Confidence::Unknown,
         evidence: "Synthetic sleep process, not a live agent".into(),

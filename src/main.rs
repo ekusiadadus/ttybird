@@ -504,12 +504,25 @@ fn focus(cli: &Cli, dir: &std::path::Path, id: &str, host: &Option<String>) -> R
     navigation::focus(target)
 }
 
-struct ScreenGuard;
+struct ScreenGuard {
+    #[cfg(unix)]
+    input_flags: libc::c_int,
+}
 
 impl ScreenGuard {
     fn enter() -> Result<Self> {
+        #[cfg(unix)]
+        // SAFETY: stdin is an open descriptor, verified before entering the TUI.
+        let input_flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+        #[cfg(unix)]
+        if input_flags == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
         crossterm::terminal::enable_raw_mode()?;
-        let guard = Self;
+        let guard = Self {
+            #[cfg(unix)]
+            input_flags,
+        };
         crossterm::execute!(
             io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
@@ -517,17 +530,98 @@ impl ScreenGuard {
         )?;
         Ok(guard)
     }
+
+    fn poll_input(&self, timeout: Duration) -> io::Result<bool> {
+        #[cfg(unix)]
+        // The backend drains incomplete sequences until WouldBlock. Scope this
+        // to input polling: stdin/stdout can share an open-file description,
+        // and a nonblocking stdout would fail under terminal backpressure.
+        // SAFETY: stdin belongs to this dashboard; the original flags are saved.
+        if unsafe {
+            libc::fcntl(
+                libc::STDIN_FILENO,
+                libc::F_SETFL,
+                self.input_flags | libc::O_NONBLOCK,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let result = crossterm::event::poll(timeout);
+        #[cfg(unix)]
+        // SAFETY: restore flags before any drawing or returning to the shell.
+        if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.input_flags) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        result
+    }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+        #[cfg(unix)]
+        // stdin can share its open-file description with the launching shell.
+        // SAFETY: restore the exact status flags captured by this guard.
+        unsafe {
+            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.input_flags);
+        }
         let _ = crossterm::execute!(
             io::stdout(),
             crossterm::cursor::Show,
             crossterm::terminal::LeaveAlternateScreen
         );
     }
+}
+
+/// Readiness only: never consume input here. Crossterm's bounded Unix backend
+/// can spend the remainder of one poll on HUP, so check both before and after it.
+/// Checking only before a poll would race a terminal closing during that call.
+fn terminal_disconnected() -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(true);
+        }
+        let mut fds = [libc::STDIN_FILENO, libc::STDOUT_FILENO].map(|fd| libc::pollfd {
+            fd,
+            events: 0,
+            revents: 0,
+        });
+        // SAFETY: fds is a valid array for the supplied length; timeout is zero.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if terminal_gone_error(&error) {
+                return Ok(true);
+            }
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(fds
+            .iter()
+            .any(|fd| fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0))
+    }
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+fn terminal_gone_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EIO | libc::ENXIO | libc::ENOTTY)
+    ) {
+        return true;
+    }
+    false
 }
 
 fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
@@ -589,8 +683,29 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
         std::result::Result<Vec<navigation::GhosttyTerminal>, String>,
     );
     let mut pane_query: Option<mpsc::Receiver<PaneQuery>> = None;
+    let mut conversation_query: Option<(
+        String,
+        mpsc::Receiver<std::result::Result<String, String>>,
+    )> = None;
+    let mut conversation_key: Option<String> = None;
+    let mut redraw = true;
     while running.load(Ordering::SeqCst) {
+        if terminal_disconnected()? {
+            break;
+        }
+        if let Some((key, receiver)) = conversation_query.as_ref()
+            && let Ok(result) = receiver.try_recv()
+        {
+            if app.show_conversation && Some(key) == conversation_key.as_ref() {
+                app.conversation_text = Some(
+                    result.unwrap_or_else(|error| format!("Conversation unavailable: {error}")),
+                );
+                redraw = true;
+            }
+            conversation_query = None;
+        }
         if let Some((session, result)) = pane_query.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            redraw = true;
             pane_query = None;
             match result {
                 Ok(mut terminals) if !terminals.is_empty() => {
@@ -621,6 +736,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
             }
         }
         while let Ok(result) = ready.try_recv() {
+            redraw = true;
             app.refreshing = false;
             match result {
                 Ok(snapshots) => app.set_snapshots(snapshots),
@@ -637,9 +753,20 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
                 }
             }
         }
+        // Refresh may replace the selection: clear old text before this frame is drawn.
+        let selected_key = app
+            .selected_session()
+            .map(ttybird::terminal_preview::selection_key);
+        if app.show_conversation && selected_key != conversation_key {
+            app.show_conversation = false;
+            app.conversation_text = None;
+            conversation_query = None;
+            redraw = true;
+        }
         if !app.refreshing && last_request.elapsed() >= Duration::from_secs(cli.interval) {
             if requests.try_send(()).is_ok() {
                 app.refreshing = true;
+                redraw = true;
             }
             last_request = Instant::now();
         }
@@ -661,6 +788,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
             .as_ref()
             .map(ttybird::terminal_preview::selection_key);
         if key != preview_key || selected_is_local != preview_local {
+            redraw = true;
             preview_generation = preview_generation.wrapping_add(1);
             preview_local = selected_is_local;
             preview_key = key;
@@ -677,6 +805,7 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
             next_preview = Instant::now();
         }
         while let Ok((generation, key, result)) = preview_ready.try_recv() {
+            redraw = true;
             preview_busy = false;
             // A slow capture for a previous selection must never paint the new one.
             if app.show_preview
@@ -731,10 +860,26 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
                 next_preview = Instant::now() + Duration::from_secs(2);
             }
         }
-        terminal.draw(|frame| ttybird::ui::draw(frame, &mut app))?;
-        if !event::poll(Duration::from_millis(80))? {
+        if redraw {
+            if let Err(error) = terminal.draw(|frame| ttybird::ui::draw(frame, &mut app)) {
+                if terminal_gone_error(&error) || terminal_disconnected()? {
+                    break;
+                }
+                return Err(error.into());
+            }
+            redraw = false;
+        }
+        let available = guard.poll_input(Duration::from_millis(80));
+        if terminal_disconnected()? || !running.load(Ordering::SeqCst) {
+            break;
+        }
+        if available.as_ref().is_err_and(terminal_gone_error) {
+            break;
+        }
+        if !available? {
             continue;
         }
+        redraw = true;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -843,6 +988,9 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
         match key.code {
             KeyCode::Char('q') => break,
             KeyCode::Esc => {
+                app.show_conversation = false;
+                app.conversation_text = None;
+                conversation_query = None;
                 pane_query = None;
                 preview_generation = preview_generation.wrapping_add(1);
                 app.show_preview = false;
@@ -853,10 +1001,46 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
             }
             KeyCode::Char('?') => app.show_help = true,
             KeyCode::Char('p') => {
+                app.show_conversation = false;
+                app.conversation_text = None;
+                conversation_query = None;
                 preview_generation = preview_generation.wrapping_add(1);
                 app.show_preview = !app.show_preview;
                 app.preview_text = None;
                 preview_key = None;
+            }
+            KeyCode::Char('c') => {
+                app.show_conversation = !app.show_conversation;
+                app.conversation_text = None;
+                app.show_preview = false;
+                app.preview_text = None;
+                app.preview_scroll = 0;
+                conversation_query = None;
+                conversation_key = app
+                    .selected_session()
+                    .map(ttybird::terminal_preview::selection_key);
+                if app.show_conversation
+                    && let Some(session) = app.selected_session().cloned()
+                {
+                    let local = app
+                        .snapshots
+                        .first()
+                        .is_some_and(|snapshot| snapshot.host == session.host);
+                    if !local || app.liveness_unavailable {
+                        app.conversation_text = Some(
+                            "Only a currently verified local session can show recent messages."
+                                .into(),
+                        );
+                    } else {
+                        let (sender, receiver) = mpsc::sync_channel(1);
+                        conversation_query = Some((conversation_key.clone().unwrap(), receiver));
+                        std::thread::spawn(move || {
+                            let result = collect::recent_conversation(&session)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = sender.send(result);
+                        });
+                    }
+                }
             }
             KeyCode::Char('d') => {
                 app.show_details = true;
@@ -868,6 +1052,12 @@ fn interactive(cli: &Cli, dir: &std::path::Path, needs_me: bool) -> Result<()> {
             KeyCode::Right => app.expand_or_child(),
             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+            KeyCode::PageDown if app.show_conversation => {
+                app.preview_scroll = app.preview_scroll.saturating_add(8).min(200);
+            }
+            KeyCode::PageUp if app.show_conversation => {
+                app.preview_scroll = app.preview_scroll.saturating_sub(8);
+            }
             KeyCode::PageDown if app.show_preview => {
                 let limit = app
                     .preview_text
@@ -1188,7 +1378,8 @@ fn main() {
         {
             return;
         }
-        eprintln!("ttybird: {error:#}");
+        // stderr can itself be a revoked PTY. Error reporting must not panic.
+        let _ = writeln!(io::stderr(), "ttybird: {error:#}");
         std::process::exit(1);
     }
 }

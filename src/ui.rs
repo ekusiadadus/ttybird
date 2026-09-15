@@ -47,6 +47,8 @@ pub struct App {
     pub preview_text: Option<Text<'static>>,
     pub preview_notice: Option<String>,
     pub preview_scroll: u16,
+    pub show_conversation: bool,
+    pub conversation_text: Option<String>,
     pub collapsed: HashSet<(String, Provider, String)>,
     pub ghostty_picker: Option<GhosttyPicker>,
 }
@@ -73,6 +75,8 @@ impl App {
         self.liveness_unavailable = true;
         self.ghostty_picker = None;
         self.preview_text = None;
+        self.show_conversation = false;
+        self.conversation_text = None;
         self.preview_scroll = 0;
         self.preview_notice = Some("Current liveness unavailable; preview paused.".into());
         for snapshot in &mut self.snapshots {
@@ -119,7 +123,10 @@ impl App {
             .snapshots
             .iter()
             .flat_map(|snapshot| snapshot.sessions.iter())
-            .filter(|session| self.show_background || !is_raw_headless(session))
+            .filter(|session| {
+                self.show_background
+                    || !(is_background(session) || is_auxiliary_process(session, &universe))
+            })
             .filter(|session| self.show_history || session.pid.is_some())
             .filter(|session| {
                 !self.needs_only
@@ -499,6 +506,34 @@ fn is_raw_headless(session: &Session) -> bool {
     session.id.contains("-pid-") && session.evidence.to_lowercase().contains("headless")
 }
 
+fn is_retained_child(session: &Session) -> bool {
+    session.pid.is_some()
+        && session.parent_id.is_some()
+        && matches!(
+            session.activity,
+            Activity::Unknown | Activity::Idle | Activity::Ended
+        )
+}
+
+fn is_background(session: &Session) -> bool {
+    is_raw_headless(session) || is_retained_child(session)
+}
+
+// Presentation grouping only, not proof of a process/session relationship.
+// Never copy its TTY, PID or navigation target onto the logical session.
+fn is_auxiliary_process(session: &Session, all: &[&Session]) -> bool {
+    is_raw_process(session)
+        && session.cwd.is_some()
+        && all.iter().any(|other| {
+            !is_raw_process(other)
+                && other.parent_id.is_none()
+                && other.pid.is_some()
+                && other.host == session.host
+                && other.provider == session.provider
+                && other.cwd == session.cwd
+        })
+}
+
 fn is_raw_process(session: &Session) -> bool {
     session.id.contains("-pid-")
         && session
@@ -546,7 +581,7 @@ fn role_detail(session: &Session, child_count: usize) -> String {
     }
 }
 
-fn shares_parent_host(session: &Session, parent: Option<&Session>) -> bool {
+fn shares_parent_process(session: &Session, parent: Option<&Session>) -> bool {
     let Some(parent) = parent else {
         return false;
     };
@@ -554,14 +589,23 @@ fn shares_parent_host(session: &Session, parent: Option<&Session>) -> bool {
         (
             session.pid,
             session.process_started_at,
-            session.tty.as_deref(),
             parent.pid,
             parent.process_started_at,
-            parent.tty.as_deref(),
         ),
-        (Some(pid), Some(started), Some(tty), Some(parent_pid), Some(parent_started), Some(parent_tty))
-            if pid == parent_pid && started == parent_started && tty == parent_tty
+        (Some(pid), Some(started), Some(parent_pid), Some(parent_started))
+            if pid == parent_pid && started == parent_started
     )
+}
+
+fn shares_parent_terminal(session: &Session, parent: Option<&Session>) -> bool {
+    shares_parent_process(session, parent)
+        && matches!(
+            (
+                session.tty.as_deref(),
+                parent.and_then(|parent| parent.tty.as_deref())
+            ),
+            (Some(tty), Some(parent_tty)) if tty == parent_tty
+        )
 }
 
 fn model_label(session: &Session) -> String {
@@ -605,6 +649,7 @@ fn matches_query(session: &Session, query: &str) -> bool {
         session.tty.as_deref().unwrap_or_default(),
         session.model.as_deref().unwrap_or_default(),
         session.parent_id.as_deref().unwrap_or_default(),
+        session.insights.title.as_deref().unwrap_or_default(),
         provider_label(&session.provider),
         state_label(session),
     ];
@@ -700,7 +745,7 @@ fn state_style(session: &Session) -> Style {
 
 fn terminal_label(session: &Session) -> String {
     match session.target.as_ref() {
-        Some(Target::Ghostty { .. }) => "Ghostty".to_owned(),
+        Some(Target::Ghostty { .. }) => "Ghostty binding".to_owned(),
         Some(Target::Tmux { pane, .. }) => format!("tmux {}", sanitize(pane, 16)),
         None => session
             .tty
@@ -760,7 +805,7 @@ fn tree_workspace_label(row: &TreeRow<'_>) -> String {
         } else {
             label.push_str(&format!(
                 "{marker} {}  ({} {noun})",
-                workspace(row.session),
+                session_title(row.session),
                 row.child_count
             ));
         }
@@ -772,19 +817,55 @@ fn tree_workspace_label(row: &TreeRow<'_>) -> String {
             label.push_str(&workspace(row.session));
             label.push_str("  ");
         }
-        label.push('[');
-        label.push_str(&short_session_suffix(&row.session.id));
-        label.push(']');
+        if let Some(title) = row.session.insights.title.as_deref() {
+            label.push_str(&sanitize(title, 100));
+        } else {
+            label.push('[');
+            label.push_str(&short_session_suffix(&row.session.id));
+            label.push(']');
+        }
     } else {
-        label.push_str(&workspace(row.session));
+        label.push_str(&session_title(row.session));
     }
     label
+}
+
+fn session_title(session: &Session) -> String {
+    session
+        .insights
+        .title
+        .as_deref()
+        .map(|title| format!("{} · {}", sanitize(title, 100), workspace(session)))
+        .unwrap_or_else(|| workspace(session))
+}
+
+fn token_label(session: &Session) -> String {
+    let Some(usage) = session.insights.usage.as_ref() else {
+        return "—".into();
+    };
+    let n = usage.total_tokens;
+    let number = if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.)
+    } else {
+        n.to_string()
+    };
+    if usage.scope == crate::model::TokenUsageScope::Sampled {
+        format!("{number}*")
+    } else {
+        number
+    }
 }
 
 fn evidence_summary(session: &Session) -> &'static str {
     let evidence = session.evidence.to_lowercase();
     if evidence.contains("headless") {
-        "Live headless process; terminal navigation is unavailable."
+        if session.target.is_some() {
+            "Live headless host process; inherited terminal suppressed. The explicit navigation binding is checked on use."
+        } else {
+            "Live headless host process; inherited terminal suppressed and child activity is not established."
+        }
     } else if evidence.contains("unique writable descriptor") {
         "Process identity and its open session log were matched directly."
     } else if evidence.contains("historical") || session.pid.is_none() {
@@ -832,9 +913,16 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, shown: usize) {
         all.iter().filter(|s| s.pid.is_none()).count()
     };
     let attention = all.iter().filter(|session| is_attention(session)).count();
-    let hidden_background = all
+    let hidden_retained = all
         .iter()
-        .filter(|session| is_raw_headless(session))
+        .filter(|session| is_retained_child(session))
+        .count();
+    let hidden_raw = all
+        .iter()
+        .filter(|session| {
+            (is_raw_headless(session) || is_auxiliary_process(session, &all))
+                && !is_retained_child(session)
+        })
         .count();
 
     let mut summary = format!(
@@ -852,8 +940,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, shown: usize) {
     if hidden_history > 0 {
         summary.push_str(&format!("  ·  {hidden_history} history hidden (h)"));
     }
-    if !app.show_background && hidden_background > 0 {
-        summary.push_str(&format!("  ·  {hidden_background} background hidden"));
+    if !app.show_background && hidden_retained > 0 {
+        summary.push_str(&format!(
+            "  ·  {hidden_retained} retained children hidden (b)"
+        ));
+    }
+    if !app.show_background && hidden_raw > 0 {
+        summary.push_str(&format!("  ·  {hidden_raw} auxiliary processes (b)"));
     }
     if app.refreshing {
         summary.push_str("  ·  refreshing…");
@@ -912,7 +1005,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             filters.push("live PID");
         }
         if app.show_background {
-            filters.push("background visible");
+            filters.push("retained/background visible");
         }
         let text = if filters.is_empty() {
             if area.width < 72 {
@@ -970,11 +1063,15 @@ fn render_sessions(
     // Preserve room for branch labels and child counts before adding the TTY column.
     let show_terminal = area.width >= if show_host { 122 } else { 104 };
 
-    let mut headings = vec!["Workspace"];
+    let show_tokens = area.width >= 62;
+    let mut headings = vec!["Session / workspace"];
     if show_agent {
         headings.push("Agent");
     }
     headings.extend(["Role", "Model", "State"]);
+    if show_tokens {
+        headings.push("Tokens");
+    }
     if show_terminal {
         headings.push("Host TTY");
     }
@@ -1007,6 +1104,9 @@ fn render_sessions(
             Cell::from(model_label(session)),
             Cell::from(state_label(session)).style(state_style(session)),
         ]);
+        if show_tokens {
+            cells.push(Cell::from(token_label(session)));
+        }
         if show_terminal {
             cells.push(Cell::from(terminal_label(session)));
         }
@@ -1031,8 +1131,11 @@ fn render_sessions(
         Constraint::Length(if compact { 7 } else { 10 }),
         Constraint::Length(if compact { 10 } else { 12 }),
     ]);
+    if show_tokens {
+        widths.push(Constraint::Length(8));
+    }
     if show_terminal {
-        widths.push(Constraint::Length(if compact { 8 } else { 13 }));
+        widths.push(Constraint::Length(if compact { 8 } else { 15 }));
     }
     if show_host {
         widths.push(Constraint::Length(if compact { 8 } else { 14 }));
@@ -1077,7 +1180,9 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
         })
         .unwrap_or_else(|| "No live PID".to_owned());
     let navigation = match session.target.as_ref() {
-        Some(Target::Ghostty { .. }) => "Enter focuses the exact Ghostty terminal".to_owned(),
+        Some(Target::Ghostty { .. }) => {
+            "Saved Ghostty binding; pane existence is checked on Enter".to_owned()
+        }
         Some(Target::Tmux { pane, .. }) => {
             format!("Enter opens verified tmux pane {}", sanitize(pane, 16))
         }
@@ -1099,7 +1204,8 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
         .flat_map(|snapshot| snapshot.sessions.iter())
         .filter(|candidate| parent_key(candidate).as_ref() == Some(&key))
         .count();
-    let shares_parent_host = shares_parent_host(session, parent);
+    let shares_parent_process = shares_parent_process(session, parent);
+    let shares_parent_terminal = shares_parent_terminal(session, parent);
     let mut lines = vec![
         value("Workspace", sanitize(&workspace(session), 100)),
         value(
@@ -1123,7 +1229,7 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
         ),
         value("Host", sanitize(&session.host, 100)),
         value(
-            if shares_parent_host {
+            if shares_parent_process {
                 "Host PID"
             } else {
                 "PID"
@@ -1157,18 +1263,28 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
             "Host process observed; an open child log does not prove a running child turn".into(),
         ));
     }
-    if shares_parent_host {
+    if shares_parent_process {
         lines.push(value(
             "Hosting",
-            "Shared parent process and terminal (PID/start/TTY match)".to_owned(),
+            "Shared parent process (PID/start match)".to_owned(),
+        ));
+        lines.push(value(
+            "Terminal link",
+            if shares_parent_terminal {
+                "Shared parent kernel TTY".to_owned()
+            } else {
+                "No shared kernel TTY verified".to_owned()
+            },
         ));
     }
+    let tty_proof = if session.tty.is_some() {
+        "Current kernel TTY assignment; does not prove an open GUI pane"
+    } else {
+        "No kernel TTY assigned, or an inherited TTY was intentionally suppressed"
+    };
     lines.extend([
         value("Host terminal", terminal_label(session)),
-        value(
-            "TTY proof",
-            "Kernel TTY assignment only; does not prove an open Ghostty pane".into(),
-        ),
+        value("TTY proof", tty_proof.into()),
         value("Evidence", evidence_summary(session).to_owned()),
         value("Source", sanitize(&session.evidence, 1200)),
         value("Navigation", navigation),
@@ -1182,10 +1298,92 @@ fn render_details(
     selected: Option<&Session>,
     snapshots: &[Snapshot],
 ) {
+    let lines = if let Some(session) = selected {
+        let mut lines = vec![
+            Line::styled(
+                session_title(session),
+                Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(""),
+            Line::from(format!(
+                "{} · {} · {}",
+                provider_label(&session.provider),
+                model_label(session),
+                state_label(session)
+            )),
+            Line::from(""),
+        ];
+        if let Some(usage) = &session.insights.usage {
+            let scope = if usage.scope == crate::model::TokenUsageScope::Sampled {
+                "sampled messages only"
+            } else {
+                "reported session total"
+            };
+            lines.extend([
+                Line::from(format!("Tokens  {} ({scope})", usage.total_tokens)),
+                Line::from(format!(
+                    "Input   {}  · cached {}",
+                    usage.input_tokens,
+                    usage
+                        .cached_input_tokens
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "not reported".into())
+                )),
+                Line::from(format!(
+                    "Output  {}  · reasoning {}",
+                    usage.output_tokens,
+                    usage
+                        .reasoning_output_tokens
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "not reported".into())
+                )),
+                Line::from("Cache/reasoning are included, not added again."),
+                Line::from("This session only; not context size or a billed cost."),
+            ]);
+        } else {
+            lines.push(Line::from(
+                "Token usage not reported in the sampled metadata.",
+            ));
+        }
+        lines.extend([
+            Line::from(""),
+            Line::from(format!("Workspace  {}", workspace(session))),
+            Line::from(format!("Terminal   {}", terminal_label(session))),
+            Line::from(""),
+            Line::from("c  Recent conversation (local, opt-in)"),
+            Line::from("p  Read-only terminal preview"),
+            Line::from("d  Process identity and evidence"),
+            Line::from("Enter  Return to the mapped terminal"),
+        ]);
+        lines
+    } else {
+        vec![Line::from("Select a session.")]
+    };
+    let _ = snapshots;
     frame.render_widget(
-        Paragraph::new(Text::from(detail_lines(selected, snapshots)))
-            .block(border_block("Details"))
+        Paragraph::new(Text::from(lines))
+            .block(border_block("Session"))
             .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
+    let content = app
+        .conversation_text
+        .as_deref()
+        .unwrap_or("Reading recent local messages…");
+    let content = content
+        .lines()
+        .take(120)
+        .map(|line| sanitize(line, 2000))
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((app.preview_scroll, 0))
+            .block(border_block("Recent conversation · local · c/Esc closes")),
         area,
     );
 }
@@ -1241,7 +1439,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if area.width < 72 {
         "j/k · ←/→ tree · Space fold · Enter focus · ?"
     } else {
-        "↑↓/jk move   ←/→ tree   Space fold   Enter focus   p preview   d details   h history   / search   ? help"
+        "↑↓/jk move   Space fold   Enter focus   c conversation   p preview   d evidence   b processes   / search   ?"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(SLATE))).alignment(Alignment::Center),
@@ -1281,12 +1479,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("← →          Collapse/parent · expand/first child"),
         Line::from("Space        Toggle the selected branch"),
         Line::from("h            Show/hide log-only history (not live sessions)"),
-        Line::from("Enter        Focus the exact verified terminal target"),
+        Line::from("Enter        Verify and focus the selected terminal target"),
         Line::from("p            Read-only terminal preview; PageUp/PageDown scroll"),
         Line::from("d            Full details; arrows/PageUp/PageDown scroll"),
         Line::from("/            Search sessions"),
         Line::from("a            Observed needs-input sessions only"),
-        Line::from("b            Show raw headless process rows"),
+        Line::from("b            Show retained children and raw headless processes"),
+        Line::from("c            Recent local user/assistant messages (opt-in, memory only)"),
         Line::from("r            Refresh local and registered hosts"),
         Line::from("Esc          Clear search or close preview/details/help"),
         Line::from("q            Quit"),
@@ -1450,7 +1649,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .constraints(constraints)
             .split(layout[2]);
         render_sessions(frame, body[0], app, &rows, multiple_hosts);
-        if app.show_preview {
+        if app.show_conversation {
+            render_conversation(frame, body[1], app);
+        } else if app.show_preview {
             render_preview(frame, body[1], app);
         } else {
             render_details(
@@ -1471,7 +1672,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .constraints(constraints)
             .split(layout[2]);
         render_sessions(frame, body[0], app, &rows, multiple_hosts);
-        if app.show_preview {
+        if app.show_conversation {
+            render_conversation(frame, body[1], app);
+        } else if app.show_preview {
             render_preview(frame, body[1], app);
         } else {
             render_details(
@@ -1526,6 +1729,7 @@ mod tests {
             tty: Some("/dev/ttys007".to_owned()),
             cwd: Some(format!("/work/{workspace_name}")),
             model: Some("gpt-test".to_owned()),
+            insights: Default::default(),
             activity,
             confidence: Confidence::Observed,
             evidence: "same-user process observed".to_owned(),
@@ -1592,7 +1796,7 @@ mod tests {
         for (width, height) in [(120, 32), (80, 24), (45, 12)] {
             let text = rendered(&mut app, width, height);
             assert!(text.contains("TTYbird"));
-            assert!(text.contains("Workspace"));
+            assert!(text.contains("Session"));
             assert!(text.contains("Role"));
             assert!(text.contains("Model"));
             assert!(!text.contains('\u{1b}'));
@@ -1636,11 +1840,8 @@ mod tests {
         assert!(details.contains("Recorded model gpt-5.6-sol"));
         assert!(details.contains("Parent model   gpt-6-astra"));
         assert!(details.contains("Host PID       42 · started 100"));
-        assert!(
-            details.contains(
-                "Hosting        Shared parent process and terminal (PID/start/TTY match)"
-            )
-        );
+        assert!(details.contains("Hosting        Shared parent process (PID/start match)"));
+        assert!(details.contains("Terminal link  Shared parent kernel TTY"));
 
         let parent = app
             .rows()
@@ -1887,6 +2088,120 @@ mod tests {
 
         app.show_background = true;
         assert_eq!(app.rows().len(), 1);
+    }
+
+    #[test]
+    fn auxiliary_processes_are_grouped_without_transferring_navigation() {
+        let mut named = session("named", "workspace", Activity::Unknown);
+        named.pid = Some(50);
+        named.target = None;
+        let mut raw = session("codex-pid-42-100", "workspace", Activity::Unknown);
+        raw.evidence = "live process; session metadata unavailable".into();
+        let mut other = raw.clone();
+        other.id = "codex-pid-43-100".into();
+        other.pid = Some(43);
+        other.cwd = Some("/work/different".into());
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![named, raw, other])]);
+        assert_eq!(app.rows().len(), 2);
+        assert!(
+            app.rows()
+                .iter()
+                .any(|row| row.id == "named" && row.target.is_none())
+        );
+        assert!(app.rows().iter().any(|row| row.id == "codex-pid-43-100"));
+        app.show_background = true;
+        assert_eq!(app.rows().len(), 3);
+    }
+
+    #[test]
+    fn titles_usage_and_opt_in_conversation_are_visible_without_identity_noise() {
+        let mut named = session("named", "workspace", Activity::Working);
+        named.insights.title = Some("Release checklist".into());
+        named.insights.usage = Some(crate::model::TokenUsage {
+            input_tokens: 1200,
+            cached_input_tokens: Some(900),
+            output_tokens: 300,
+            reasoning_output_tokens: Some(100),
+            total_tokens: 1500,
+            scope: crate::model::TokenUsageScope::Sampled,
+        });
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![named])]);
+        let text = rendered(&mut app, 200, 34);
+        assert!(text.contains("Release checklist"));
+        assert!(text.contains("1.5k*"));
+        assert!(text.contains("sampled messages only"));
+        assert!(!text.contains("process started"));
+        app.query = "checklist".into();
+        assert_eq!(app.rows().len(), 1);
+        app.show_conversation = true;
+        app.conversation_text =
+            Some("User: synthetic question\n\nAssistant: synthetic reply".into());
+        assert!(rendered(&mut app, 200, 34).contains("synthetic reply"));
+        app.invalidate_liveness();
+        assert!(!app.show_conversation);
+        assert!(app.conversation_text.is_none());
+    }
+
+    #[test]
+    fn retained_children_are_hidden_by_default_and_counted() {
+        let parent = session("parent", "workspace", Activity::Unknown);
+        let child = |id, activity| {
+            let mut child = session(id, "workspace", activity);
+            child.parent_id = Some(parent.id.clone());
+            child
+        };
+        let working = child("working", Activity::Working);
+        let waiting = child("waiting", Activity::WaitingTool);
+        let idle = child("idle", Activity::Idle);
+        let ended = child("ended", Activity::Ended);
+        let unknown = child("unknown", Activity::Unknown);
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![
+            unknown, ended, idle, waiting, working, parent,
+        ])]);
+
+        let ids: HashSet<_> = app
+            .rows()
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        assert_eq!(ids, HashSet::from(["parent", "working", "waiting"]));
+        assert_eq!(app.tree_rows()[0].child_count, 5);
+        assert!(rendered(&mut app, 200, 32).contains("3 retained children hidden (b)"));
+
+        app.show_background = true;
+        assert_eq!(app.rows().len(), 6);
+    }
+
+    #[test]
+    fn headless_child_shares_host_without_claiming_a_tty_or_live_ghostty_pane() {
+        let mut parent = session("parent", "workspace", Activity::Working);
+        parent.tty = None;
+        parent.target = None;
+        let mut child = session("child", "workspace", Activity::Working);
+        child.parent_id = Some(parent.id.clone());
+        child.tty = None;
+        child.evidence = "same-user headless process and log matched by a unique writable descriptor; inherited terminal target suppressed".to_owned();
+        child.target = Some(Target::Ghostty {
+            terminal_id: "12345678-1234-1234-1234-123456789abc".to_owned(),
+        });
+        let snapshots = vec![snapshot(vec![child, parent])];
+        let child = &snapshots[0].sessions[0];
+        let details = lines_text(&detail_lines(Some(child), &snapshots));
+
+        assert!(details.contains("Host PID       42 · started 100"));
+        assert!(details.contains("Hosting        Shared parent process (PID/start match)"));
+        assert!(details.contains("Terminal link  No shared kernel TTY verified"));
+        assert!(details.contains("Host terminal  Ghostty binding"));
+        assert!(
+            details.contains(
+                "No kernel TTY assigned, or an inherited TTY was intentionally suppressed"
+            )
+        );
+        assert!(details.contains("explicit navigation binding is checked on use"));
+        assert!(details.contains("Saved Ghostty binding; pane existence is checked on Enter"));
     }
 
     #[test]

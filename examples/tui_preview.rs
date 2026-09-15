@@ -38,6 +38,7 @@ fn session(
         tty: Some(format!("ttys00{pid}")),
         cwd: Some(format!("/work/{cwd}")),
         model: None,
+        insights: Default::default(),
         activity,
         confidence,
         evidence: "Synthetic UI fixture; no real agent content.".into(),

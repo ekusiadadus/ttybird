@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -109,6 +111,38 @@ pub enum Confidence {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageScope {
+    /// A provider-supplied cumulative total, or a complete transcript sum.
+    Total,
+    /// A sum from the bounded portions of a transcript that were inspected.
+    Sampled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// All input tokens. A reported cached input count is a subset.
+    pub input_tokens: u64,
+    /// `None` when the provider did not report this field.
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: u64,
+    /// Reported reasoning/thinking output, already included in output.
+    /// `None` when the provider did not report this field.
+    pub reasoning_output_tokens: Option<u64>,
+    pub total_tokens: u64,
+    pub scope: TokenUsageScope,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInsights {
+    pub title: Option<String>,
+    pub usage: Option<TokenUsage>,
+    /// Collection-only identity for explicit, revalidated local conversation reads.
+    #[serde(skip)]
+    pub(crate) log_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
@@ -137,6 +171,8 @@ pub struct Session {
     pub evidence: String,
     pub updated_at: Option<i64>,
     pub target: Option<Target>,
+    #[serde(default)]
+    pub insights: SessionInsights,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +198,7 @@ impl Snapshot {
 
 #[cfg(test)]
 mod provider_tests {
-    use super::Provider;
+    use super::{Provider, Session};
 
     #[test]
     fn provider_names_match_serialized_values_and_unknown_is_forward_compatible() {
@@ -177,6 +213,32 @@ mod provider_tests {
             Provider::Unknown
         );
         assert!(!Provider::ALL.contains(&Provider::Unknown));
+    }
+
+    #[test]
+    fn session_insights_default_for_older_snapshots_and_skip_local_path() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id":"old",
+            "provider":"codex",
+            "parent_id":null,
+            "host":"local",
+            "pid":null,
+            "process_started_at":null,
+            "tty":null,
+            "cwd":null,
+            "model":null,
+            "activity":"unknown",
+            "confidence":"unknown",
+            "evidence":"fixture",
+            "updated_at":null,
+            "target":null
+        }))
+        .unwrap();
+        assert_eq!(session.insights, Default::default());
+
+        let serialized = serde_json::to_value(&session).unwrap();
+        assert_eq!(serialized["insights"]["title"], serde_json::Value::Null);
+        assert!(serialized["insights"].get("log_path").is_none());
     }
 }
 

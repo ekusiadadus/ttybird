@@ -155,6 +155,7 @@ pub fn enrich(dir: &Path, snapshot: &mut Snapshot) -> Result<()> {
             tty: None,
             cwd: event.cwd,
             model: None,
+            insights: Default::default(),
             activity,
             confidence: if fresh {
                 Confidence::Observed

@@ -4,6 +4,8 @@ Preserve active agent sessions. Collection is read-only and must never send term
 
 Exception for the user-requested terminal preview: explicit `p` in the TUI may display the selected, verified local tmux pane's visible contents in memory. Never persist, log, export in JSON, or collect these contents in the background when preview is closed. Preview never sends input or changes agent state. Keep synthetic fixtures for preview tests.
 
+Exception for the user-requested conversation view: explicit `c` may read the selected local Codex/Claude transcript after revalidating PID, start time, session ID and unique writable ownership. Display only a bounded recent user/assistant plaintext excerpt in memory; never tool arguments, system messages or reasoning. Close/selection changes clear it. Never export excerpts in JSON, persist them or fetch them with the view closed. Provider-recorded titles and token metadata may be collected; treat titles as personal metadata.
+
 Keep unknown, inferred, and observed states distinct. A live process is not proof of an active model turn. A log is not proof of a live process. Match process identity with PID and start time; never focus based solely on working directory.
 
 Validate with cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test, and a local read-only smoke test. Keep fixture logs synthetic. Network and terminal integration tests must state which paths were exercised.

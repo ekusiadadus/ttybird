@@ -29,6 +29,12 @@ pub fn parse(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<Text<'static>
         max_scrollback: 0,
     })
     .context("create preview terminal")?;
+    // Text previews do not need Glyph Protocol objects or a large APC buffer.
+    terminal
+        .set_apc_max_bytes(Some(4096))
+        .context("bound preview APC buffer")?
+        .set_glyph_protocol_enabled(false)
+        .context("disable preview glyph protocol")?;
     terminal.vt_write(&input);
 
     let mut render_state = RenderState::new().context("create preview render state")?;
@@ -314,6 +320,15 @@ mod tests {
         assert_eq!(content(&text.lines[0]), "ok done");
         assert!(!text.to_string().contains('\x1b'));
         assert!(!text.to_string().contains("payload"));
+
+        // An oversized APC must be discarded without swallowing later text.
+        let mut oversized = b"ok\x1b_".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', 8192));
+        oversized.extend_from_slice(b"\x1b\\ done");
+        assert_eq!(
+            parse(&oversized, 20, 2).unwrap().to_string().trim(),
+            "ok done"
+        );
     }
 
     #[test]
