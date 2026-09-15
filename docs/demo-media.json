@@ -1,0 +1,16 @@
+{
+  "source": "Synthetic session fixtures; real Ratatui rendering and App tree methods",
+  "live_sessions_captured": false,
+  "terminal_focus_performed": false,
+  "frames": 7,
+  "duration_ms": 16400,
+  "visible_text_privacy_check": "passed on every rendered cell row",
+  "workspaces": [
+    "ttybird",
+    "demo-api",
+    "demo-web",
+    "demo-docs",
+    "demo-infra"
+  ],
+  "reproduce": "cargo build --release --locked --example tui_preview && uv run --with pillow scripts/capture_demo.py"
+}

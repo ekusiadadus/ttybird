@@ -1,0 +1,77 @@
+name: Rust
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            archive: x86_64-unknown-linux-gnu
+          - os: macos-14
+            archive: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Install tmux
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null; then
+            if [[ "$RUNNER_OS" == macOS ]]; then brew install tmux; else sudo apt-get update && sudo apt-get install -y tmux; fi
+          fi
+      - run: cargo fmt --check
+      - run: cargo clippy --release --locked --all-targets -- -D warnings
+      - run: cargo test --release --locked -- --test-threads=2
+      - name: Private tmux integration in C locale
+        run: LC_ALL=C cargo test --release --locked --test tmux_preview -- --ignored
+      - run: cargo build --release --locked --bin ttybird
+      - name: Real PTY and process integration (synthetic agents only)
+        run: |
+          python3 scripts/tui_smoke.py target/release/ttybird
+          python3 scripts/liveness_smoke.py target/release/ttybird
+          LC_ALL=C python3 scripts/tmux_preview_smoke.py target/release/ttybird --gemini
+      - name: Ghostty chooser protocol (stub, no GUI focus)
+        if: runner.os == 'macOS'
+        run: python3 scripts/ghostty_picker_smoke.py target/release/ttybird
+      - name: Prepare portable archive
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          python3 scripts/package_release.py "$ARCHIVE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ttybird-${{ matrix.archive }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish tested alpha archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --prerelease --title "TTYbird $RELEASE_TAG" --notes "Alpha builds for Apple Silicon macOS and x86_64 Linux (Ubuntu 24.04 / glibc 2.39 or newer). Includes the pinned Ghostty VT parser and third-party license texts. See README and docs/VALIDATION.md for supported operations and known limits."
