@@ -14,12 +14,27 @@ requires your explicit choice the first time.
 [日本語](README.ja.md) · [Architecture](docs/ARCHITECTURE.md) ·
 [Provider coverage](docs/PROVIDERS.md) · [Tests and limits](docs/VALIDATION.md)
 
-![Parent/child selection, details and terminal preview](docs/walkthrough.gif)
+The walkthrough starts with the parent/child tree, recorded titles and token
+metadata, then uses `/` search, `c` conversation, `p` read-only preview and `d`
+evidence before **Enter** returns to the session's existing terminal.
 
-*Synthetic session data rendered by the actual TUI. The chooser in this demo
-does not perform a real Ghostty focus operation.*
+![TTYbird walkthrough: session tree, titles, tokens, search, conversation, read-only preview, evidence and return to an existing terminal](docs/walkthrough.gif)
+
+*The TTYbird interaction and tmux focus are real; the agent processes, session
+data and messages are synthetic. It was recorded on a private tmux server, does
+not show Ghostty GUI focus and calls no model or API. See [capture evidence](docs/demo-media.json).*
 
 ## Install and run
+
+With Homebrew (Apple Silicon macOS 14+, or x86_64 Linux with glibc 2.39+):
+
+```sh
+brew install ekusiadadus/tap/ttybird
+ttybird --local
+```
+
+The tap installs the tested release binary; no Rust or Zig build is needed.
+Install `tmux` separately if you want tmux navigation and previews.
 
 Download the archive for your platform from [Releases](https://github.com/ekusiadadus/ttybird/releases).
 Alpha archives target Apple Silicon macOS 14+ and x86_64 Linux with glibc 2.39+
@@ -60,10 +75,11 @@ The Rust binding is pinned to `libghostty-vt = 0.2.1`; Zig 0.16 is incompatible.
 | Space / ← / → | Fold, expand, or navigate the parent/child tree |
 | Enter | Return to its mapped terminal, or choose a Ghostty pane |
 | p | Toggle local tmux preview; PageUp/PageDown scroll the captured screen |
+| c | Recent local Codex/Claude messages, only when requested; Esc closes |
 | d | Full metadata and evidence |
-| / | Search workspace, provider, host or session |
+| / | Search title, workspace, provider, host or session |
 | a | Only observed requests needing input |
-| b / h | Show background processes / recent log-only history |
+| b / h | Show retained children, auxiliary and background processes / recent log-only history |
 | r / ? | Refresh / keyboard help |
 | q / Ctrl-C | Exit and restore the terminal |
 
@@ -79,9 +95,34 @@ tools and `ttybird providers` reports adapter capabilities.
   currently supply observed input notifications. Other supported CLIs expose
   process metadata, with unknown activity. See [the adapter matrix](docs/PROVIDERS.md).
 - `log only` is history, hidden by default. Open logs do not prove that a child
-  is currently running. [Liveness](docs/LIVENESS.md) explains the boundaries.
+  is currently running. Children with idle, ended or unknown activity are also
+  hidden by default; `b` reveals them without claiming they are working.
+  [Liveness](docs/LIVENESS.md) explains the boundaries.
+- `Ghostty binding` means a saved navigation target, not a confirmed open pane.
+  The target is checked when you press Enter.
 - Focus returns to the **hosting terminal**, not Codex's internal subagent view.
   TTYbird never infers a Ghostty binding from a working directory alone.
+
+## Titles, tokens and conversation
+
+The main view prioritizes provider-recorded session titles and token usage.
+Missing metadata is shown as unavailable, never estimated from the model name.
+Codex uses the latest reported cumulative token snapshot; repeated snapshots
+are not added together. Claude usage is deduplicated by message ID and marked
+`*` because it covers sampled messages, not a guaranteed complete session.
+Counts include cached input and reasoning output in their respective totals;
+they are not context-window size, a bill, or an aggregate of all children.
+
+Press **c** for up to three recent local user/assistant messages. TTYbird
+rechecks the process and transcript identity before reading. This view excludes
+tools, system messages and reasoning; it stays in memory, is not exported in
+JSON, and clears when closed or selection changes. Reopen it to refresh the
+excerpt; it is a snapshot, not a live stream. Remote conversations and
+providers without a verified transcript are unavailable.
+
+When a session is present, raw processes of the same provider/host/workspace
+are hidden by default and available with **b**. This is a display preference,
+not an identity merge: no PID, TTY or navigation binding is copied between them.
 
 ## libghostty-vt preview
 
@@ -102,7 +143,8 @@ full scrollback. Wide previews are clipped to the available dashboard width.
 **libghostty-vt does not extract screens from Ghostty.app.** Ghostty-only and SSH
 previews are not implemented. Ghostty focus uses AppleScript; tmux navigation
 uses the exact socket, pane and TTY. Supported rendering and limitations are
-listed in [validation](docs/VALIDATION.md).
+listed in [validation](docs/VALIDATION.md). The [2026-09-16 upstream audit](docs/LIBGHOSTTY.md)
+compares the pinned Rust binding, released Ghostty and unreleased APIs.
 
 ## SSH, explicit bindings and hooks
 
@@ -135,8 +177,8 @@ lifecycle metadata, not prompts. See `ttybird --help` for CLI options.
 ## Privacy and development
 
 Collection exports metadata, not prompts, tool arguments or raw command lines.
-An explicit preview can contain sensitive pane text; it remains in memory and
-is excluded from logs/JSON. Session IDs, directories and host names are personal
+Explicit terminal and conversation views can contain sensitive text; they remain
+in memory and are excluded from logs/JSON. Titles, IDs, directories and host names are personal
 metadata: inspect exported snapshots before sharing them.
 
 Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and

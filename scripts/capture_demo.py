@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / 'target/release/examples/tui_preview').resolve()
 OUT = ROOT / 'target/demo-media'
 OUT.mkdir(parents=True, exist_ok=True)
-DOCS = ROOT / 'docs'
+# Static fixture renders are developer artifacts. record_demo.py owns public media.
+DOCS = OUT
 FONT = ImageFont.truetype('/System/Library/Fonts/Menlo.ttc', 16)
 FORBIDDEN = ('toioswarm', 'isucon', 'rovnou', 'livepass', 'ekusiadadus', '/users/', '/home/')
 

@@ -65,10 +65,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Generate Homebrew formula from tested archives
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 packaging/homebrew/render_formula.py --version "${RELEASE_TAG#v}" --output dist/ttybird.rb
       - name: Publish tested alpha archives
         env:
           GH_TOKEN: ${{ github.token }}

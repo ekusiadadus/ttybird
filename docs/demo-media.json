@@ -1,16 +1,245 @@
 {
-  "source": "Synthetic session fixtures; real Ratatui rendering and App tree methods",
-  "live_sessions_captured": false,
-  "terminal_focus_performed": false,
-  "frames": 7,
-  "duration_ms": 16400,
-  "visible_text_privacy_check": "passed on every rendered cell row",
-  "workspaces": [
-    "ttybird",
-    "demo-api",
-    "demo-web",
-    "demo-docs",
-    "demo-infra"
+  "source": "Actual compiled TTYbird TUI on a private tmux server, synthetic writable logs and agent process",
+  "real_agent_content_exported": false,
+  "real_tmux_focus_performed": true,
+  "ghostty_gui_focus_performed": false,
+  "frames": [
+    {
+      "caption": "Find your coding agents",
+      "explanation": "Session titles, models and token usage in one place.",
+      "key": "",
+      "duration_ms": 1900,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "See what each child is doing",
+      "explanation": "Astra coordinates; each Sol child keeps its own session.",
+      "key": "Down",
+      "duration_ms": 1500,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Check recorded usage",
+      "explanation": "Per-session tokens; cached input is included, not added twice.",
+      "key": "Down",
+      "duration_ms": 1700,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Return to the parent",
+      "explanation": "Left moves from a child to its parent.",
+      "key": "Left",
+      "duration_ms": 700,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Less clutter in one keystroke",
+      "explanation": "Fold the branch without stopping any agent.",
+      "key": "Space",
+      "duration_ms": 1100,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Expand when you need the detail",
+      "explanation": "The parent and its children stay together.",
+      "key": "Right",
+      "duration_ms": 850,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Move through the tree",
+      "explanation": "Right selects the first child.",
+      "key": "Right",
+      "duration_ms": 700,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Search without leaving the dashboard.",
+      "key": "/",
+      "duration_ms": 650,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Find the session by its title",
+      "explanation": "Type a few letters to narrow the list.",
+      "key": "type: titles",
+      "duration_ms": 90,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Keep the matching session in view",
+      "explanation": "Search matches titles, workspaces and session metadata.",
+      "key": "Enter",
+      "duration_ms": 1500,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Read the latest local messages",
+      "explanation": "A bounded excerpt, opened on request; never exported in JSON.",
+      "key": "c",
+      "duration_ms": 2200,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Close the excerpt and clear the search",
+      "explanation": "Conversation text is cleared when the view closes.",
+      "key": "Esc",
+      "duration_ms": 1200,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Inspect the evidence when it matters",
+      "explanation": "PID, parent relationship and navigation target remain inspectable.",
+      "key": "d",
+      "duration_ms": 2100,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Back to the session overview",
+      "explanation": "Technical details stay out of the main view.",
+      "key": "Esc",
+      "duration_ms": 800,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Preview without switching terminals",
+      "explanation": "tmux captures the pane; libghostty-vt parses its text and colors.",
+      "key": "p",
+      "duration_ms": 2200,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Watch the preview refresh",
+      "explanation": "New output appears from the source pane. TTYbird sends no input.",
+      "key": "",
+      "duration_ms": 2000,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Keep your existing terminal workflow",
+      "explanation": "Close the preview; the original pane keeps running.",
+      "key": "p",
+      "duration_ms": 1100,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "The controls are always one key away",
+      "explanation": "Tree navigation, search, conversation, preview and terminal focus.",
+      "key": "?",
+      "duration_ms": 1800,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Ready to return to the original terminal",
+      "explanation": "Enter uses the verified mapping, not a workspace-name guess.",
+      "key": "Enter next",
+      "duration_ms": 1500,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "You are back in the original tmux pane",
+      "explanation": "This step really changes the active pane; it does not start a new agent.",
+      "key": "Enter",
+      "duration_ms": 2100,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    },
+    {
+      "caption": "Try it: ttybird --local",
+      "explanation": "Actual TTYbird interaction. Synthetic data. No model or API calls.",
+      "key": "",
+      "duration_ms": 2000,
+      "cols": 160,
+      "rows": 28,
+      "privacy_check": "passed"
+    }
   ],
-  "reproduce": "cargo build --release --locked --example tui_preview && uv run --with pillow scripts/capture_demo.py"
+  "duration_ms": 30140,
+  "timing": "Edited playback: short navigation beats and longer explanatory holds; not a wall-clock performance measurement",
+  "reproduce": "cargo build --release --locked --bin ttybird --example capture_frame && uv run --with pillow scripts/record_demo.py"
 }
