@@ -127,7 +127,7 @@ func snapshot(_ area: AXUIElement) -> [String: Any] {
 }
 do {
     let created = try script(fixtureConfig("FIRST") + """
-    
+
     set w to new window with configuration cfg
     return (id of w) & "|" & (id of terminal 1 of selected tab of w) & "|" & (id of selected tab of w)
     """)
@@ -208,7 +208,7 @@ do {
     for i in 0..<3 { record("C05-cost", "observed", ["sample": i, "snapshot": snapshot(area)]); pump(0.55) }
     _ = try confirmedPhase("AFTER_LARGE")
     let secondID = try script(fixtureConfig("SECOND") + """
-    
+
     set t to new tab in window id "\(windowID)" with configuration cfg
     return id of terminal 1 of t
     """)
