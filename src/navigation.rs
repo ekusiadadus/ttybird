@@ -34,14 +34,24 @@ JSON.stringify(app.terminals().map(term => ({
 #[cfg(target_os = "macos")]
 const GHOSTTY_FOCUS_APPLESCRIPT: &str = r#"
 on run argv
-    if (count of argv) is not 1 then error "expected one terminal id"
-    set terminalID to item 1 of argv
-    tell application "Ghostty"
-        if not (exists terminal id terminalID) then error "terminal does not exist"
-        focus (terminal id terminalID)
-    end tell
+    try
+        if (count of argv) is not 1 then error "expected one terminal id"
+        set terminalID to item 1 of argv
+        tell application "Ghostty"
+            if not (exists terminal id terminalID) then error "terminal does not exist"
+            focus (terminal id terminalID)
+        end tell
+        return "TTYBIRD_GHOSTTY_OK"
+    on error errorMessage number errorNumber
+        return "TTYBIRD_GHOSTTY_ERROR|" & (errorNumber as text) & "|" & errorMessage
+    end try
 end run
 "#;
+
+#[cfg(target_os = "macos")]
+const GHOSTTY_FOCUS_OK: &str = "TTYBIRD_GHOSTTY_OK";
+#[cfg(target_os = "macos")]
+const GHOSTTY_FOCUS_ERROR: &str = "TTYBIRD_GHOSTTY_ERROR|";
 
 #[cfg(target_os = "macos")]
 pub fn ghostty_terminals() -> Result<Vec<GhosttyTerminal>> {
@@ -218,9 +228,50 @@ fn focus_ghostty(terminal_id: &str) -> Result<()> {
         "--".to_owned(),
         terminal_id.to_owned(),
     ];
-    run_bounded("osascript", &args, COMMAND_TIMEOUT, 4096)
+    let output = run_bounded("osascript", &args, COMMAND_TIMEOUT, 4096)
         .context("failed to focus Ghostty terminal")?;
-    Ok(())
+    parse_ghostty_focus_result(&output)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ghostty_focus_result(output: &[u8]) -> Result<()> {
+    let response = std::str::from_utf8(output)
+        .context("Ghostty focus returned non-UTF-8 data")?
+        .trim_end_matches(['\r', '\n']);
+    if response == GHOSTTY_FOCUS_OK {
+        return Ok(());
+    }
+    let Some(payload) = response.strip_prefix(GHOSTTY_FOCUS_ERROR) else {
+        bail!("Ghostty focus returned an unexpected response");
+    };
+    let (number, message) = payload
+        .split_once('|')
+        .context("Ghostty focus returned an invalid error response")?;
+    if number.is_empty()
+        || number.len() > 16
+        || !number
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| byte.is_ascii_digit() || (index == 0 && byte == b'-'))
+    {
+        bail!("Ghostty focus returned an invalid error number");
+    }
+    let detail: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect();
+    let detail = detail.trim();
+    if detail.is_empty() {
+        bail!("Ghostty focus failed (AppleScript error {number})");
+    }
+    bail!("Ghostty focus failed (AppleScript error {number}): {detail}")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -363,6 +414,22 @@ mod tests {
         assert_eq!(target_tty(&valid).unwrap(), None);
         assert!(validate_ghostty_id("not-a-uuid").is_err());
         assert!(validate_ghostty_id("D55DE9BA-D3E6-410A-8DE0-D7ACBF8253BX").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn parses_bounded_ghostty_focus_result() {
+        assert!(parse_ghostty_focus_result(b"TTYBIRD_GHOSTTY_OK\n").is_ok());
+        let error = parse_ghostty_focus_result(
+            b"TTYBIRD_GHOSTTY_ERROR|-1712|Ghostty timed out\nretry\tlater\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "Ghostty focus failed (AppleScript error -1712): Ghostty timed out retry later"
+        );
+        assert!(parse_ghostty_focus_result(b"unstructured output\n").is_err());
     }
 
     #[test]

@@ -10,6 +10,8 @@
   lsof,
   tmux,
   openssh,
+  gitMinimal,
+  libnotify,
   runtimeShell,
   python3,
   writeShellScriptBin,
@@ -30,7 +32,9 @@
       unixtools.ps
       tmux
       openssh
+      gitMinimal
     ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [libnotify]
     ++ lib.optionals (!stdenv.hostPlatform.isLinux) [lsof];
   appleSdk = pkgs.apple-sdk;
   darwinSdkDiscovery = writeShellScriptBin "xcode-select" ''

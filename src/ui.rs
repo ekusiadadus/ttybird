@@ -120,7 +120,10 @@ struct TreeRow<'a> {
     depth: usize,
     ancestor_has_more: Vec<bool>,
     is_last: bool,
+    /// All direct children retained in the snapshot, including filtered rows.
     child_count: usize,
+    /// Direct children admitted by the current filters, before branch folding.
+    visible_child_count: usize,
     working_children: usize,
     collapsed: bool,
 }
@@ -389,7 +392,7 @@ impl App {
         let Some((key, child_count)) = self
             .tree_rows()
             .get(self.selected)
-            .map(|row| (session_key(row.session), row.child_count))
+            .map(|row| (session_key(row.session), row.visible_child_count))
         else {
             return;
         };
@@ -407,7 +410,7 @@ impl App {
                 (
                     session_key(row.session),
                     row.parent.map(session_key),
-                    row.child_count,
+                    row.visible_child_count,
                     row.collapsed,
                 )
             })
@@ -429,11 +432,13 @@ impl App {
     }
 
     pub fn expand_or_child(&mut self) {
-        let Some((key, child_count, collapsed)) = self
-            .tree_rows()
-            .get(self.selected)
-            .map(|row| (session_key(row.session), row.child_count, row.collapsed))
-        else {
+        let Some((key, child_count, collapsed)) = self.tree_rows().get(self.selected).map(|row| {
+            (
+                session_key(row.session),
+                row.visible_child_count,
+                row.collapsed,
+            )
+        }) else {
             return;
         };
         if child_count == 0 {
@@ -483,7 +488,8 @@ fn append_tree<'a>(
         return;
     }
     let child_count = known_children.get(&key).map_or(0, Vec::len);
-    let working_children = known_children.get(&key).map_or(0, |children| {
+    let visible_child_count = visible_children.get(&key).map_or(0, Vec::len);
+    let working_children = visible_children.get(&key).map_or(0, |children| {
         children
             .iter()
             .filter(|child| {
@@ -493,7 +499,7 @@ fn append_tree<'a>(
             })
             .count()
     });
-    let collapsed = !reveal_collapsed && child_count > 0 && collapsed_keys.contains(&key);
+    let collapsed = !reveal_collapsed && visible_child_count > 0 && collapsed_keys.contains(&key);
     rows.push(TreeRow {
         session,
         parent,
@@ -501,6 +507,7 @@ fn append_tree<'a>(
         ancestor_has_more: ancestor_has_more.clone(),
         is_last,
         child_count,
+        visible_child_count,
         working_children,
         collapsed,
     });
@@ -858,9 +865,9 @@ fn tree_workspace_label(row: &TreeRow<'_>) -> String {
         label.push_str(if row.is_last { "└─ " } else { "├─ " });
     }
 
-    if row.child_count > 0 {
+    if row.visible_child_count > 0 {
         let marker = if row.collapsed { '▸' } else { '▾' };
-        let noun = if row.child_count == 1 {
+        let noun = if row.visible_child_count == 1 {
             "child"
         } else {
             "children"
@@ -878,14 +885,14 @@ fn tree_workspace_label(row: &TreeRow<'_>) -> String {
             label.push('[');
             label.push_str(&short_session_suffix(&row.session.id));
             label.push_str(&format!(
-                "]  ({} recorded {noun}; {} working?)",
-                row.child_count, row.working_children
+                "]  ({} shown {noun}; {} working?)",
+                row.visible_child_count, row.working_children
             ));
         } else {
             label.push_str(&format!(
-                "{marker} {}  ({} recorded {noun}; {} working?)",
+                "{marker} {}  ({} shown {noun}; {} working?)",
                 session_title(row.session),
-                row.child_count,
+                row.visible_child_count,
                 row.working_children
             ));
         }
@@ -1473,6 +1480,7 @@ fn render_details(
             Line::from("d  Process identity and evidence"),
             Line::from("H  Prepare a reviewed handoff → Codex"),
             Line::from("N  Attention inbox · read / acknowledge / snooze"),
+            Line::from("g  Relink the Ghostty terminal (also for a child's parent)"),
             Line::from(enter_hint(session, snapshots)),
         ]);
         lines
@@ -1671,6 +1679,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Enter / i    Owned terminal: enter INPUT mode in the right pane"),
         Line::from("Ctrl+]       Leave INPUT mode; q in the list detaches"),
         Line::from("H / N        Reviewed handoff / attention inbox"),
+        Line::from("g            Relink the Ghostty terminal (also for a child's parent)"),
         Line::from("p            Read-only terminal preview; PageUp/PageDown scroll"),
         Line::from("d            Full details; arrows/PageUp/PageDown scroll"),
         Line::from("/            Search sessions"),
@@ -2202,11 +2211,11 @@ mod tests {
         assert_eq!(role_label(rows[1].session, rows[1].child_count), "Subagent");
         assert_eq!(
             tree_workspace_label(&rows[0]),
-            "▾ ttybird  (2 recorded children; 2 working?)"
+            "▾ ttybird  (2 shown children; 2 working?)"
         );
         assert_eq!(
             tree_workspace_label(&rows[1]),
-            "├─ ▾ […11111111]  (1 recorded child; 1 working?)"
+            "├─ ▾ […11111111]  (1 shown child; 1 working?)"
         );
         assert_eq!(tree_workspace_label(&rows[2]), "│  └─ […33333333]");
         assert_eq!(tree_workspace_label(&rows[3]), "└─ z-worktree  […22222222]");
@@ -2223,6 +2232,7 @@ mod tests {
 
         app.toggle_branch();
         assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.tree_rows()[0].visible_child_count, 1);
         assert!(app.collapsed.contains(&session_key(&refreshed.sessions[1])));
         app.set_snapshots(vec![refreshed]);
         assert_eq!(app.selected_session().unwrap().id, "parent");
@@ -2477,14 +2487,81 @@ mod tests {
             .collect();
         assert_eq!(ids, HashSet::from(["parent", "working", "waiting"]));
         assert_eq!(app.tree_rows()[0].child_count, 5);
+        assert_eq!(app.tree_rows()[0].visible_child_count, 2);
         assert_eq!(app.tree_rows()[0].working_children, 1);
-        assert!(
-            tree_workspace_label(&app.tree_rows()[0]).contains("5 recorded children; 1 working?")
-        );
+        assert!(tree_workspace_label(&app.tree_rows()[0]).contains("2 shown children; 1 working?"));
         assert!(rendered(&mut app, 200, 32).contains("3 retained children hidden (b)"));
 
         app.show_background = true;
         assert_eq!(app.rows().len(), 6);
+        assert_eq!(app.tree_rows()[0].visible_child_count, 5);
+        assert!(tree_workspace_label(&app.tree_rows()[0]).contains("5 shown children; 1 working?"));
+    }
+
+    #[test]
+    fn retained_children_do_not_create_an_empty_expandable_branch() {
+        let parent = session("parent", "workspace", Activity::Working);
+        let child = |id, activity| {
+            let mut child = session(id, "workspace", activity);
+            child.parent_id = Some(parent.id.clone());
+            child
+        };
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![
+            child("unknown", Activity::Unknown),
+            child("ended", Activity::Ended),
+            child("idle", Activity::Idle),
+            parent,
+        ])]);
+
+        let rows = app.tree_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].child_count, 3);
+        assert_eq!(rows[0].visible_child_count, 0);
+        assert_eq!(tree_workspace_label(&rows[0]), "workspace");
+
+        app.toggle_branch();
+        assert_eq!(app.rows().len(), 1);
+        assert!(app.collapsed.is_empty());
+
+        app.show_background = true;
+        let rows = app.tree_rows();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].visible_child_count, 3);
+        assert_eq!(
+            tree_workspace_label(&rows[0]),
+            "▾ workspace  (3 shown children; 0 working?)"
+        );
+        app.toggle_branch();
+        assert_eq!(app.rows().len(), 1);
+    }
+
+    #[test]
+    fn waiting_children_remain_expandable_without_working_children() {
+        let parent = session("parent", "workspace", Activity::Working);
+        let mut waiting_input = session("input", "workspace", Activity::WaitingInput);
+        waiting_input.parent_id = Some(parent.id.clone());
+        let mut waiting_tool = session("tool", "workspace", Activity::WaitingTool);
+        waiting_tool.parent_id = Some(parent.id.clone());
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![waiting_tool, waiting_input, parent])]);
+
+        let rows = app.tree_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].visible_child_count, 2);
+        assert_eq!(rows[0].working_children, 0);
+        assert_eq!(
+            tree_workspace_label(&rows[0]),
+            "▾ workspace  (2 shown children; 0 working?)"
+        );
+
+        app.toggle_branch();
+        assert_eq!(app.rows().len(), 1);
+        app.expand_or_child();
+        assert_eq!(app.rows().len(), 3);
+        assert_eq!(app.selected_session().unwrap().id, "parent");
+        app.expand_or_child();
+        assert_ne!(app.selected_session().unwrap().id, "parent");
     }
 
     #[test]

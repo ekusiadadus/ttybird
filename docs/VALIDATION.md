@@ -34,7 +34,7 @@ explicitly; CI runs it in addition to the ordinary suite.
 | Boundary | Evidence | What is not established |
 |---|---|---|
 | Process/session identity | Real synthetic live process, descriptor close, stale binding, zombie and exit; comparison with `ps` | Every provider's live API state; atomic OS snapshot |
-| Parent/child display | Scoped links, cycle handling, folds, filter and selection transitions | Independently executing model calls for each visible child |
+| Parent/child display | Scoped links, cycle handling, folds, filter and selection transitions, no empty branch affordance, retained child reveal and waiting-child expansion | Independently executing model calls for each visible child |
 | VT conversion | Pinned native libghostty-vt parses captures; owned text/styles are rendered by Ratatui | Full Ghostty GUI renderer equivalence, arbitrary PTY streams or graphics |
 | tmux preview | Real private pane; colors/Unicode/CR/erase, alternate screen, wrong identity, unchanged pane/buffers | Arbitrary tmux versions and remote capture |
 | Dashboard | Real PTY, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings, preview close/reopen | Exhaustive terminal emulators/keymaps |
@@ -42,7 +42,7 @@ explicitly; CI runs it in addition to the ordinary suite.
 | Workspace metadata | Temporary real Git repositories, dirty/untracked paths, subdirectories, symlinks, detached HEAD, linked worktrees, caching and truncation | Network remotes, submodule contents, semantic meaning of a change |
 | Attention inbox | Synthetic observed hook transitions, sustained-event deduplication, read/acknowledge/snooze, stale expiry, restart deduplication and failed-delivery backoff with a fake notifier | A real desktop notification daemon, provider states without hook evidence, task completion |
 | Reviewed handoff | Temporary checkout, explicit note selection, private draft round-trip, credential/outside-path rejection, checkout drift rejection, real PTY review/edit/cancel, synthetic Codex argv/cwd/private-file delivery and stop cleanup | Model readiness/quality, automatic summarization, or an unreviewed external handoff |
-| Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection, exact-ID focus invocation, failed-focus binding rollback, dashboard retained after picker/saved focus, q restoration | A GUI end-to-end focus test on every Ghostty version |
+| Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection, exact-ID focus invocation, failed-focus binding rollback and bounded error detail, unavailable Ghostty preview preserving the session view, explicit relink, dashboard retained after picker/saved focus, q restoration | A GUI end-to-end focus test on every Ghostty version |
 | SSH collector | Fixed command, versioned protocol, invalid destination rejection, bounded child execution | Authenticated multi-host network test |
 | Release portability | CI-native build and library reference check, version execution before packaging | Notarization, signing, all macOS/Linux versions |
 

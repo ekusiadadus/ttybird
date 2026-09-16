@@ -61,7 +61,10 @@ local tmux pane's screen appears on the right, refreshing every two seconds.
 This preview is read-only; Enter returns to the actual terminal for typing.
 It needs a window at least 105 columns wide (narrower windows stack the views).
 Plain Ghostty tabs do not expose a supported live screen-reading API; run the
-agent inside tmux in Ghostty to use the preview.
+agent inside tmux in Ghostty to use the preview. Unsupported selections keep
+the session summary visible. For a new embedded terminal without tmux, use
+`ttybird run -- codex`. A failed or outdated Ghostty binding can be replaced
+with `g`; select the correct pane explicitly.
 
 Nix users can build the pinned package or enter the dev shell; see [Nix](docs/NIX.md).
 For a source build, install Rust 1.90+ and **Zig 0.15.2**:
@@ -110,6 +113,7 @@ viewer resize applies. Embedded mouse input and terminal graphics are not suppor
 | ↑ / ↓ or j / k | Select a session |
 | Space / ← / → | Fold, expand, or navigate the parent/child tree |
 | Enter | Open its terminal; a child without one uses its recorded parent |
+| g | Relink the local Ghostty pane, including a child’s parent terminal |
 | Enter / i on an owned terminal | Enter INPUT mode in the right pane |
 | Ctrl+] in INPUT mode | Return to the list without stopping the program |
 | p | Toggle local tmux preview; PageUp/PageDown scroll the captured screen |
@@ -124,8 +128,9 @@ viewer resize applies. Embedded mouse input and terminal graphics are not suppor
 | q / Ctrl-C | Exit and restore the terminal |
 
 `Parent` describes a relationship, not active work. For example,
-`3 recorded children; 0 working?` includes completed/idle/unknown children;
-the second count is only the children currently inferred to be working.
+a parent with no displayable children has no expand arrow or child count.
+Space changes only branches that can reveal rows. `b` reveals retained children;
+recorded relationships remain in Details.
 
 For a child without its own terminal, Enter opens its **recorded parent's**
 terminal. Only the parent needs the initial Ghostty mapping. `c` still opens the

@@ -28,6 +28,26 @@ pub fn selection_key(session: &Session) -> String {
     .expect("serializable session identity")
 }
 
+/// UI preflight only; capture still revalidates the process and pane.
+pub fn unavailable_reason(session: &Session, local_host: &str) -> Option<&'static str> {
+    if session.host != local_host {
+        return Some("Remote screen preview is unavailable. Enter opens its mapped terminal.");
+    }
+    if session.pid.is_none() || session.process_started_at.is_none() {
+        return Some("This entry has no verified live terminal to preview.");
+    }
+    match session.target {
+        Some(Target::Tmux { .. }) if session.tty.is_some() => None,
+        Some(Target::Managed { .. }) => None,
+        Some(Target::Ghostty { .. }) => Some(
+            "This Ghostty tab cannot be embedded. Enter opens it; c shows conversation. For a new embedded session: ttybird run -- codex",
+        ),
+        _ => Some(
+            "No readable terminal mapping. Use a local tmux pane or start a new embedded session with ttybird run -- codex.",
+        ),
+    }
+}
+
 fn live_identity(session: &Session) -> Result<()> {
     let pid = session
         .pid

@@ -1034,7 +1034,10 @@ fn interactive(
                     }
                     "Focused Ghostty. TTYbird stays open here; q quits.".into()
                 }
-                Err(error) => format!("Cannot focus terminal: {}", clean(&error)),
+                Err(error) => format!(
+                    "Cannot focus terminal: {} · g: relink Ghostty pane",
+                    clean(&error)
+                ),
             });
         }
         if let Some((key, receiver)) = conversation_query.as_ref()
@@ -1221,6 +1224,19 @@ fn interactive(
                 redraw = true;
             }
             last_request = Instant::now();
+        }
+        if app.show_preview
+            && app.managed_id.is_none()
+            && let Some(session) = app.selected_session()
+            && let Some(local) = app.snapshots.first()
+            && let Some(reason) =
+                ttybird::terminal_preview::unavailable_reason(session, &local.host)
+        {
+            app.show_preview = false;
+            app.preview_text = None;
+            app.notice = Some(reason.into());
+            preview_generation = preview_generation.wrapping_add(1);
+            redraw = true;
         }
         let selected = (app.show_preview
             && app.managed_id.is_none()
@@ -1667,8 +1683,30 @@ fn interactive(
             KeyCode::Char('?') => app.show_help = true,
             KeyCode::Char('p') => {
                 if app.managed_id.is_some() {
-                    app.notice = Some("Owned terminal is already visible; Enter or i enables input, Ctrl+] returns here.".into());
+                    app.show_conversation = false;
+                    app.conversation_text = None;
+                    conversation_query = None;
+                    app.show_preview = false;
+                    app.notice = Some(
+                        "Owned terminal is visible; Enter or i enables input, Ctrl+] returns here."
+                            .into(),
+                    );
                     continue;
+                }
+                if !app.show_preview {
+                    if let Some(session) = app.selected_session()
+                        && let Some(local) = app.snapshots.first()
+                        && let Some(reason) =
+                            ttybird::terminal_preview::unavailable_reason(session, &local.host)
+                    {
+                        app.notice = Some(reason.into());
+                        continue;
+                    }
+                    if app.selected_session().is_none() {
+                        app.notice =
+                            Some("Select a local tmux or owned terminal to preview.".into());
+                        continue;
+                    }
                 }
                 app.show_conversation = false;
                 app.conversation_text = None;
@@ -1774,7 +1812,8 @@ fn interactive(
                 app.show_details = false;
                 owned_next_frame = Instant::now();
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('g') => {
+                let relink = key.code == KeyCode::Char('g');
                 if focus_query.is_some() {
                     app.notice = Some("A terminal focus request is still running.".into());
                     continue;
@@ -1790,6 +1829,20 @@ fn interactive(
                     );
                 }
                 if let Some(session) = navigation {
+                    if relink
+                        && (session.host
+                            != app.snapshots.first().map(|s| s.host.as_str()).unwrap_or("")
+                            || session
+                                .target
+                                .as_ref()
+                                .is_some_and(|target| !matches!(target, Target::Ghostty { .. })))
+                    {
+                        app.notice = Some(
+                            "g relinks local Ghostty panes only. Use Enter for this terminal."
+                                .into(),
+                        );
+                        continue;
+                    }
                     if matches!(session.target, Some(Target::Managed { .. }))
                         && app.managed_id.is_some()
                     {
@@ -1800,7 +1853,7 @@ fn interactive(
                         owned_next_frame = Instant::now();
                         continue;
                     }
-                    if session.target.is_none() {
+                    if session.target.is_none() || relink {
                         let is_local = app.snapshots.first().is_some_and(|snapshot| {
                             snapshot.host == session.host
                                 && snapshot.sessions.iter().any(|row| {

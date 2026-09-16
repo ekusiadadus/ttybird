@@ -61,7 +61,13 @@ def terminate_owned_group(process):
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    process.wait(timeout=2)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        # A stopped fixture wrapper may not consume the group signal promptly;
+        # kill and reap the owned leader directly without touching other jobs.
+        process.kill()
+        process.wait(timeout=5)
 
 
 def main():
@@ -116,10 +122,11 @@ if "JavaScript" in sys.argv:
     raise SystemExit(0)
 if "AppleScript" in sys.argv and sys.argv[-1] in ({FIRST_UUID!r}, {SECOND_UUID!r}):
     if os.path.exists({fail_focus_path!r}):
-        print("synthetic focus failure", file=sys.stderr)
-        raise SystemExit(1)
+        print("TTYBIRD_GHOSTTY_ERROR|-1712|synthetic focus failure")
+        raise SystemExit(0)
     with open({focus_path!r}, "a", encoding="utf-8") as file:
         file.write(sys.argv[-1] + "\\n")
+    print("TTYBIRD_GHOSTTY_OK")
     raise SystemExit(0)
 raise SystemExit(64)
 '''
@@ -247,7 +254,10 @@ sys.exit(code)
                     if dashboard.poll() is not None:
                         break
                     drain(0.1)
-                assert marker in output, f"expected dashboard marker {marker!r} was not rendered"
+                assert marker in output, (
+                    f"expected dashboard marker {marker!r} was not rendered; "
+                    f"tail={bytes(output[-4000:])!r}"
+                )
 
             wait_for(b"TTYbird")
             os.write(master, ("/" + os.path.basename(root)).encode())
@@ -339,13 +349,14 @@ sys.exit(code)
             output.clear()
             os.write(master, b"\r")
             wait_for(b"Choose Ghostty pane")
-            # Failed transport must roll back the new mapping without exiting.
+            # A reported Ghostty/Automation failure must roll back the new
+            # mapping without exiting and expose its bounded error detail.
             open(fail_focus_path, "w").close()
             output.clear()
             os.write(master, b"\x1b[B\r")
             # The terminal renderer may split changed text into cursor-addressed
             # runs. Wait for the distinctive failure suffix, not the whole line.
-            wait_for(b"unsuccessfully")
+            wait_for(b"synthetic focus failure")
             assert dashboard.poll() is None, "failed focus closed the dashboard"
             assert read_bindings(bindings_path) == [], "failed focus retained the new binding"
             os.unlink(fail_focus_path)
@@ -373,6 +384,34 @@ sys.exit(code)
             with open(focus_path, encoding="utf-8") as file:
                 focused = file.read().splitlines()
             assert focused == [SECOND_UUID], "focus did not receive exactly the chosen UUID"
+
+            # Ghostty exposes navigation metadata but no bounded screen API.
+            # Preview must explain that limitation without focusing again or
+            # replacing the normal session view with a blank preview panel.
+            output.clear()
+            os.write(master, b"p")
+            # Ratatui updates changed spans independently, so the last letter
+            # can be separated by a cursor-addressed write.
+            wait_for(b"cannot be embedd")
+            assert b"Enter opens it" in output
+            assert dashboard.poll() is None, "unsupported preview closed the dashboard"
+            assert b"Terminal preview \xc2\xb7 read-only" not in output
+            with open(focus_path, encoding="utf-8") as file:
+                assert file.read().splitlines() == [SECOND_UUID]
+
+            # Explicit relink is also cancellable. Opening the chooser from an
+            # existing Ghostty mapping must not replace or focus that mapping.
+            output.clear()
+            os.write(master, b"g")
+            wait_for(b"Choose Ghostty pane")
+            os.write(master, b"\x1b")
+            # The preceding notice shares most of this row; ratatui leaves the
+            # unchanged "c" cell in place and only emits the changed suffix.
+            wait_for(b"hanged.")
+            assert b"no binding " in output
+            assert read_bindings(bindings_path) == [binding]
+            with open(focus_path, encoding="utf-8") as file:
+                assert file.read().splitlines() == [SECOND_UUID]
 
             # A second Enter follows the saved mapping and keeps the TUI alive.
             output.clear()
@@ -405,6 +444,10 @@ sys.exit(code)
                         "fake_focus_calls": 2,
                         "dashboard_survived_picker_and_saved_focus": True,
                         "failed_focus_rolled_back_and_kept_dashboard": True,
+                        "failed_focus_detail_visible": True,
+                        "ghostty_preview_explains_unavailable": True,
+                        "ghostty_preview_did_not_focus": True,
+                        "cancelled_relink_preserved_binding": True,
                         "terminal_restored": True,
                         "exit": 0,
                     }
