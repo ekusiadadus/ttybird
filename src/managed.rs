@@ -610,7 +610,8 @@ fn open_pty(cols: u16, rows: u16) -> Result<(File, File, String)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut dimensions,
+            // Darwin declares this mutable; Linux declares it const.
+            &raw mut dimensions,
         )
     } == -1
     {
