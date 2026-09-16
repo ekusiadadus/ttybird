@@ -90,6 +90,7 @@ def main():
         focus_path = os.path.join(root, "focused-uuid")
         fail_focus_path = os.path.join(root, "fail-focus")
         export_path = os.path.join(root, "export-calls")
+        good_export_path = os.path.join(root, "successful-export")
         try:
             for directory in ("empty-codex", "empty-claude", "fake-bin"):
                 os.makedirs(os.path.join(root, directory))
@@ -118,6 +119,17 @@ import sys
 if "JavaScript" in sys.argv and any("write_screen_file:copy,vt" in arg for arg in sys.argv):
     with open({export_path!r}, "a") as file:
         file.write(sys.argv[-3] + "\\n")
+    if os.path.exists({good_export_path!r}):
+        import secrets
+        from pathlib import Path
+        directory = Path(sys.argv[-1]) / secrets.token_urlsafe(16)
+        directory.mkdir(mode=0o700)
+        path = directory / "screen.txt"
+        data = "".join("OLD-%03d\\r\\n" % i for i in range(220)) + "X" * 220 + "\\r\\nLATEST_PROMPT"
+        path.write_bytes(data.encode())
+        path.chmod(0o600)
+        print(json.dumps({{"ok": True, "path": str(path)}}))
+        raise SystemExit(0)
     print(json.dumps({{"ok": False, "error": "terminal_not_found"}}))
     raise SystemExit(0)
 if "JavaScript" in sys.argv:
@@ -417,6 +429,19 @@ sys.exit(code)
             drain(2.3)
             with open(export_path) as file:
                 assert file.read().splitlines() == [SECOND_UUID] * 3
+            # A successful capture opens at its tail, then reflows without a new export.
+            open(good_export_path, "w").close()
+            output.clear()
+            os.write(master, b"r")
+            wait_for(b"LATEST_PROMPT")
+            with open(export_path) as file:
+                assert len(file.read().splitlines()) == 4
+            for cols in (110, 80, 160):
+                output.clear()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, cols, 0, 0))
+                wait_for(b"LATEST_PROMPT")
+                with open(export_path) as file:
+                    assert len(file.read().splitlines()) == 4, "resize recaptured the clipboard"
             os.write(master, b"p")
             drain(0.2)
 
@@ -468,6 +493,7 @@ sys.exit(code)
                         "failed_focus_detail_visible": True,
                         "selected_ghostty_opens_without_p_and_does_not_poll": True,
                         "ghostty_preview_did_not_focus": True,
+                        "ghostty_latest_output_and_cached_resize": True,
                         "cancelled_relink_preserved_binding": True,
                         "terminal_restored": True,
                         "exit": 0,

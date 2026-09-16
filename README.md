@@ -274,7 +274,7 @@ full scrollback. Wide previews are clipped to the available dashboard width.
 the session captures one snapshot. `r` refreshes; `p` toggles the preview. TTYbird asks
 that exact terminal UUID to perform `write_screen_file:copy,vt`, reads the
 private generated file (at most 1 MiB), removes it, and renders the VT data
-with libghostty-vt at 120 columns and up to the latest 200 rows. No input or
+with libghostty-vt at the preview panel width with up to the latest 200 rows, initially showing the newest output. Resizing reuses the captured data without another export. No input or
 focus command is sent. This is exported output including scrollback; cursor,
 original wrapping and scroll position are not preserved as an exact mirror.
 

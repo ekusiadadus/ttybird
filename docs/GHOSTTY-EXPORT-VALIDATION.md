@@ -6,7 +6,7 @@ Verified 2026-09-16 on macOS, Ghostty 1.3.1 (15212), local TTYbird 0.10.2 develo
 
 Explicitly map the correct Ghostty pane using `g` if necessary. Selecting a mapped local terminal displays it directly. `r` captures again; `p`/Esc closes the snapshot. `p` reopens it. Enter still focuses the existing terminal. No tmux or agent restart is required. Only a verified local process with a saved exact UUID binding is supported.
 
-This is a VT **output snapshot**, including retained scrollback. TTYbird renders it at 120 columns, keeping up to the latest 200 rows. It does not preserve the exact original viewport, cursor, wrapping or scroll position. No automatic polling occurs on this route.
+This is a VT **output snapshot**, including retained scrollback. TTYbird renders it at the preview panel width, keeping up to the latest 200 rows and initially showing the newest output. Resizing reuses the captured data without another export. It does not preserve the exact original viewport, cursor, wrapping or scroll position. No automatic polling occurs on this route.
 
 ## Chronological checkpoints (JST)
 
@@ -38,3 +38,7 @@ python3 scripts/ghostty_picker_smoke.py target/release/ttybird
 ```
 
 The wrapper preserves the original clipboard in memory, seeds two synthetic representations, verifies them after the run, and restores/readbacks the original only if no unrelated copy replaced the seed. Run after building with the repository's pinned Zig toolchain.
+
+## Fitted preview regression (2026-09-16, v0.11.1)
+
+The dashboard now reflows the cached export at the panel width and opens at the latest output. A real PTY test with a synthetic export checks initial tail display and three resizes without another capture; Ratatui buffer tests cover long lines and Japanese text in side-by-side and stacked layouts. Native synthetic Ghostty selected, hidden, split, and closed UUID scenarios passed again, parsing each successful capture at 48, 93, and 140 columns. Temporary files, fixture processes, and multi-format clipboard restoration were checked. This does not claim an exact original viewport or interactive input support.

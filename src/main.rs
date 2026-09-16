@@ -979,12 +979,12 @@ fn interactive(
     let mut last_request = Instant::now();
     let mut discard_refresh = false;
     // Preview is opt-in and independent of the metadata collector. Only owned
-    // screen cells cross this channel; the !Send VT parser stays on its worker.
+    // screen cells or bounded export bytes cross this channel; native handles never do.
     let (preview_requests, preview_work) = mpsc::sync_channel::<(u64, String, Session, String)>(1);
     let (preview_results, preview_ready) = mpsc::sync_channel(1);
     preview_worker.0 = Some(std::thread::spawn(move || {
         while let Ok((generation, key, session, local_host)) = preview_work.recv() {
-            let result = ttybird::terminal_preview::capture(&session, &local_host)
+            let result = ttybird::terminal_preview::capture_snapshot(&session, &local_host)
                 .map_err(|e| format!("{e:#}"));
             if preview_results.send((generation, key, result)).is_err() {
                 break;
@@ -992,6 +992,8 @@ fn interactive(
         }
     }));
     let mut preview_key = None;
+    let mut ghostty_export: Option<Vec<u8>> = None;
+    let mut preview_dimensions = (0, 0);
     let mut auto_preview_selection = None;
     let mut preview_generation = 0u64;
     let mut preview_local = false;
@@ -1421,6 +1423,10 @@ fn interactive(
             preview_generation = preview_generation.wrapping_add(1);
             redraw = true;
         }
+        if !app.show_preview {
+            ghostty_export = None;
+            preview_dimensions = (0, 0);
+        }
         let selected = (app.show_preview
             && !app.show_details
             && !app.show_conversation
@@ -1449,6 +1455,7 @@ fn interactive(
             preview_generation = preview_generation.wrapping_add(1);
             preview_local = selected_is_local;
             preview_key = key;
+            ghostty_export = None;
             app.preview_text = None;
             app.preview_capture_requested = selected
                 .as_ref()
@@ -1480,30 +1487,67 @@ fn interactive(
                 && preview_key.as_ref() == Some(&key)
             {
                 match result {
-                    Ok(text) => {
-                        app.preview_scroll = app
-                            .preview_scroll
-                            .min(text.lines.len().saturating_sub(1) as u16);
-                        app.preview_text = Some(text);
+                    Ok(capture) => {
+                        match capture {
+                            ttybird::terminal_preview::CapturedPreview::Screen(text) => {
+                                ghostty_export = None;
+                                app.preview_text = Some(text);
+                            }
+                            ttybird::terminal_preview::CapturedPreview::Ghostty(bytes) => {
+                                ghostty_export = Some(bytes);
+                                // Render the new capture below at the actual panel width.
+                                preview_dimensions = (0, 0);
+                            }
+                        }
                         app.preview_notice = Some(format!(
                             "Updated {} · {}",
                             chrono::Local::now().format("%H:%M:%S"),
-                            if selected
-                                .as_ref()
-                                .is_some_and(ttybird::terminal_preview::manual_snapshot)
-                            {
-                                "exported output · 120 cols / last 200 rows · r captures again"
+                            if ghostty_export.is_some() {
+                                "exported output · fitted width / latest output · r captures again"
                             } else {
                                 "visible screen only"
                             }
                         ));
                     }
                     Err(error) => {
+                        ghostty_export = None;
                         app.preview_text = None;
                         app.preview_notice = Some(clean(&error));
                     }
                 }
             }
+        }
+        // Reuse the bounded export on resize; never recapture the clipboard for layout.
+        let size = terminal.size()?;
+        let dimensions =
+            ttybird::ui::preview_size(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+        if app.show_preview && dimensions != preview_dimensions {
+            if let Some(bytes) = ghostty_export.as_ref() {
+                let follow_tail = preview_dimensions == (0, 0)
+                    || app.preview_scroll
+                        >= ttybird::ui::preview_max_scroll(
+                            app.preview_text.as_ref(),
+                            preview_dimensions.1,
+                        );
+                if dimensions.0 != preview_dimensions.0 {
+                    match ttybird::preview::parse_export(bytes, dimensions.0) {
+                        Ok(text) => app.preview_text = Some(text),
+                        Err(error) => {
+                            app.preview_text = None;
+                            app.preview_notice = Some(clean(&error.to_string()));
+                        }
+                    }
+                }
+                let limit =
+                    ttybird::ui::preview_max_scroll(app.preview_text.as_ref(), dimensions.1);
+                app.preview_scroll = if follow_tail {
+                    limit
+                } else {
+                    app.preview_scroll.min(limit)
+                };
+                redraw = true;
+            }
+            preview_dimensions = dimensions;
         }
         if let Some(session) = selected
             && (!ttybird::terminal_preview::manual_snapshot(&session)
@@ -2019,11 +2063,8 @@ fn interactive(
                 app.preview_scroll = app.preview_scroll.saturating_sub(8);
             }
             KeyCode::PageDown if app.show_preview => {
-                let limit = app
-                    .preview_text
-                    .as_ref()
-                    .map(|t| t.lines.len().saturating_sub(1) as u16)
-                    .unwrap_or(0);
+                let limit =
+                    ttybird::ui::preview_max_scroll(app.preview_text.as_ref(), dimensions.1);
                 app.preview_scroll = app.preview_scroll.saturating_add(8).min(limit);
             }
             KeyCode::PageUp if app.show_preview => {
@@ -2031,6 +2072,11 @@ fn interactive(
             }
             KeyCode::PageDown => app.move_selection(10),
             KeyCode::PageUp => app.move_selection(-10),
+            KeyCode::Home if app.show_preview => app.preview_scroll = 0,
+            KeyCode::End if app.show_preview => {
+                app.preview_scroll =
+                    ttybird::ui::preview_max_scroll(app.preview_text.as_ref(), dimensions.1);
+            }
             KeyCode::Home => {
                 app.selected = 0;
                 app.move_selection(0);

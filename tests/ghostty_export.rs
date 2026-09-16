@@ -22,26 +22,33 @@ fn synthetic_native_snapshot() {
             .any(|w| w == expected.as_bytes()),
         "exact fixture marker missing"
     );
-    let text = ttybird::preview::parse_vt(&bytes, 120, 200).expect("VT parse failed");
-    let rendered = text
-        .lines
-        .iter()
-        .map(|line| {
-            line.spans
+    for cols in [48, 93, 140] {
+        let text = ttybird::preview::parse_export(&bytes, cols).expect("VT parse failed");
+        assert!(
+            text.lines
                 .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        rendered.contains(&expected),
-        "fixture missing from rendered output"
-    );
-    assert!(
-        rendered.contains("日本語"),
-        "Unicode did not survive export and VT parsing"
-    );
+                .all(|line| line.width() <= usize::from(cols))
+        );
+        let rendered = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains(&expected),
+            "fixture missing from rendered output"
+        );
+        assert!(
+            rendered.contains("日本語"),
+            "Unicode did not survive export and VT parsing"
+        );
+    }
     println!(
         "native_export_and_libghostty_render_verified=true bytes={}",
         bytes.len()

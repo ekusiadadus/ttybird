@@ -98,6 +98,16 @@ pub fn parse_vt(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<Text<'stat
     Ok(Text::from(lines))
 }
 
+/// Reflow an exported history at the destination width, keeping a bounded tail.
+/// Empty rows added by the emulator are not part of the exported content.
+pub fn parse_export(bytes: &[u8], cols: u16) -> anyhow::Result<Text<'static>> {
+    let mut text = parse_vt(bytes, cols, MAX_ROWS)?;
+    while text.lines.last().is_some_and(|line| line.spans.is_empty()) {
+        text.lines.pop();
+    }
+    Ok(text)
+}
+
 fn validate_limits(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<()> {
     ensure!(cols > 0 && rows > 0, "preview dimensions must be non-zero");
     ensure!(cols <= MAX_COLS, "preview width exceeds {MAX_COLS} columns");

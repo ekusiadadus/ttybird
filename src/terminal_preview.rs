@@ -179,7 +179,19 @@ pub fn capture_tmux(target: &Target, tty: &str) -> Result<Text<'static>> {
     crate::preview::parse(&bytes, before.cols, before.rows)
 }
 
+pub enum CapturedPreview {
+    Screen(Text<'static>),
+    Ghostty(Vec<u8>),
+}
+
 pub fn capture(session: &Session, local_host: &str) -> Result<Text<'static>> {
+    match capture_snapshot(session, local_host)? {
+        CapturedPreview::Screen(text) => Ok(text),
+        CapturedPreview::Ghostty(bytes) => crate::preview::parse_export(&bytes, 120),
+    }
+}
+
+pub fn capture_snapshot(session: &Session, local_host: &str) -> Result<CapturedPreview> {
     if session.host != local_host {
         bail!("Remote preview is not available yet. Enter opens the remote terminal.");
     }
@@ -191,12 +203,13 @@ pub fn capture(session: &Session, local_host: &str) -> Result<Text<'static>> {
     let require_tty = matches!(target, Target::Tmux { .. }) || session.tty.is_some();
     live_identity(session, require_tty)?;
     let screen = match target {
-        Target::Tmux { .. } => {
-            capture_tmux(target, session.tty.as_deref().context("Missing agent TTY")?)?
-        }
+        Target::Tmux { .. } => CapturedPreview::Screen(capture_tmux(
+            target,
+            session.tty.as_deref().context("Missing agent TTY")?,
+        )?),
         Target::Ghostty { terminal_id } => {
             let bytes = crate::ghostty_export::capture(terminal_id)?;
-            crate::preview::parse_vt(&bytes, 120, 200)?
+            CapturedPreview::Ghostty(bytes)
         }
         _ => bail!("This terminal does not support snapshot capture"),
     };

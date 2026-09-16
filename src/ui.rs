@@ -1796,6 +1796,36 @@ fn render_managed(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// Inner size of the snapshot panel; use the same split as `draw`.
+pub fn preview_size(area: Rect) -> (u16, u16) {
+    let body = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area)[2];
+    let constraints = [Constraint::Percentage(40), Constraint::Percentage(60)];
+    let pane = if area.width >= 105 {
+        Layout::horizontal(constraints).split(body)[1]
+    } else {
+        Layout::vertical(constraints).split(body)[1]
+    };
+    (
+        pane.width.saturating_sub(2).clamp(1, 500),
+        pane.height.saturating_sub(2),
+    )
+}
+
+pub fn preview_max_scroll(text: Option<&Text<'_>>, visible_rows: u16) -> u16 {
+    text.map_or(0, |text| {
+        text.lines
+            .len()
+            .saturating_sub(usize::from(visible_rows))
+            .min(usize::from(u16::MAX)) as u16
+    })
+}
+
 /// Matches the terminal panel layout below, excluding borders.
 pub fn managed_size(area: Rect) -> (u16, u16) {
     let body_height = area.height.saturating_sub(5);
@@ -2995,6 +3025,53 @@ mod tests {
         assert!(text.contains("Preview unavailable"));
         assert!(text.contains("readable tmux pane"));
         assert!(text.contains("p close"));
+    }
+
+    #[test]
+    fn ghostty_export_fits_panel_and_opens_at_latest_output_after_resize() {
+        let mut selected = session("snapshot", "ttybird", Activity::Idle);
+        selected.target = Some(Target::Ghostty {
+            terminal_id: "11111111-1111-4111-8111-111111111111".into(),
+        });
+        // One captured export is reused across wide, narrow and stacked layouts.
+        let mut export = (0..220)
+            .map(|i| format!("old-{i:03}\r\n"))
+            .collect::<String>();
+        export.push_str("\x1b[32m");
+        export.push_str(&"x".repeat(220));
+        export.push_str("日本語 e\u{301} RIGHT_EDGE\x1b[0m\r\nLATEST_PROMPT");
+        let mut app = App {
+            show_preview: true,
+            ..Default::default()
+        };
+        app.set_snapshots(vec![snapshot(vec![selected])]);
+        for (width, height) in [(160, 32), (110, 28), (80, 32)] {
+            let (cols, rows) = preview_size(Rect::new(0, 0, width, height));
+            let text = crate::preview::parse_export(export.as_bytes(), cols).unwrap();
+            assert!(
+                text.lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(cols))
+            );
+            app.preview_scroll = preview_max_scroll(Some(&text), rows);
+            app.preview_text = Some(text);
+            let screen = rendered(&mut app, width, height);
+            assert!(
+                screen.matches('x').count() >= 220,
+                "wrapped output was cropped at {width}: {screen}"
+            );
+            assert!(
+                screen.contains("LATEST_PROMPT"),
+                "latest output hidden at {width}: {screen}"
+            );
+            assert!(!screen.contains("old-020"));
+            // PageUp has an immediate effect; no padding below the real export.
+            app.preview_scroll = app.preview_scroll.saturating_sub(8);
+            assert!(!rendered(&mut app, width, height).contains("LATEST_PROMPT"));
+        }
+        let short = crate::preview::parse_export(b"short prompt", 80).unwrap();
+        assert_eq!(short.lines.len(), 1);
+        assert_eq!(preview_max_scroll(Some(&short), 20), 0);
     }
 
     #[test]
