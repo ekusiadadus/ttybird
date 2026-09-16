@@ -29,6 +29,10 @@ pub struct GhosttyPicker {
 
 #[derive(Default)]
 pub struct App {
+    pub handoff: Option<crate::handoff_view::View>,
+    pub attention: Vec<crate::attention::AttentionItem>,
+    pub show_inbox: bool,
+    pub inbox_selected: usize,
     pub snapshots: Vec<Snapshot>,
     pub selected: usize,
     pub query: String,
@@ -117,6 +121,7 @@ struct TreeRow<'a> {
     ancestor_has_more: Vec<bool>,
     is_last: bool,
     child_count: usize,
+    working_children: usize,
     collapsed: bool,
 }
 
@@ -478,6 +483,16 @@ fn append_tree<'a>(
         return;
     }
     let child_count = known_children.get(&key).map_or(0, Vec::len);
+    let working_children = known_children.get(&key).map_or(0, |children| {
+        children
+            .iter()
+            .filter(|child| {
+                child.pid.is_some()
+                    && child.activity == Activity::Working
+                    && child.confidence != Confidence::Unknown
+            })
+            .count()
+    });
     let collapsed = !reveal_collapsed && child_count > 0 && collapsed_keys.contains(&key);
     rows.push(TreeRow {
         session,
@@ -486,6 +501,7 @@ fn append_tree<'a>(
         ancestor_has_more: ancestor_has_more.clone(),
         is_last,
         child_count,
+        working_children,
         collapsed,
     });
 
@@ -861,12 +877,16 @@ fn tree_workspace_label(row: &TreeRow<'_>) -> String {
             }
             label.push('[');
             label.push_str(&short_session_suffix(&row.session.id));
-            label.push_str(&format!("]  ({} {noun})", row.child_count));
+            label.push_str(&format!(
+                "]  ({} recorded {noun}; {} working?)",
+                row.child_count, row.working_children
+            ));
         } else {
             label.push_str(&format!(
-                "{marker} {}  ({} {noun})",
+                "{marker} {}  ({} recorded {noun}; {} working?)",
                 session_title(row.session),
-                row.child_count
+                row.child_count,
+                row.working_children
             ));
         }
     } else if row.session.parent_id.is_some() {
@@ -991,6 +1011,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, shown: usize) {
         distinct_pids.len(),
         live_ttys.len()
     );
+    let unread = app
+        .attention
+        .iter()
+        .filter(|item| item.read_at.is_none() && !item.is_snoozed(chrono::Utc::now().timestamp()))
+        .count();
+    if unread > 0 {
+        summary.push_str(&format!("  ·  {unread} new events (N)"));
+    }
     if app.liveness_unavailable {
         summary = format!(
             "Liveness unavailable · {} retained records · retrying collection",
@@ -1411,6 +1439,30 @@ fn render_details(
                 "Token usage not reported in the sampled metadata.",
             ));
         }
+        if let Some(git) = &session.insights.workspace {
+            lines.push(Line::from(format!(
+                "Branch  {} · {}",
+                sanitize(git.branch.as_deref().unwrap_or("detached HEAD"), 120),
+                if git.dirty {
+                    "changes present"
+                } else {
+                    "clean"
+                }
+            )));
+            lines.push(Line::from(format!(
+                "Checkout  {}",
+                sanitize(&git.checkout_root.to_string_lossy(), 240)
+            )));
+            if git.linked_worktree {
+                lines.push(Line::from("Separate Git worktree"));
+            }
+        }
+        if let Some(sharing) = &session.insights.sharing {
+            lines.push(Line::from(Span::styled(
+                sanitize(sharing, 300),
+                Style::default().fg(AMBER),
+            )));
+        }
         lines.extend([
             Line::from(""),
             Line::from(format!("Workspace  {}", workspace(session))),
@@ -1419,6 +1471,8 @@ fn render_details(
             Line::from("c  Recent conversation (local, opt-in)"),
             Line::from("p  Read-only terminal preview"),
             Line::from("d  Process identity and evidence"),
+            Line::from("H  Prepare a reviewed handoff → Codex"),
+            Line::from("N  Attention inbox · read / acknowledge / snooze"),
             Line::from(enter_hint(session, snapshots)),
         ]);
         lines
@@ -1505,7 +1559,22 @@ fn render_managed(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!("{name} · VIEW · Enter or i to type")
     };
-    let block = border_block(&mode);
+    let context = app
+        .selected_session()
+        .map(|s| {
+            format!(
+                "{} · {} · {}",
+                workspace(s),
+                provider_label(&s.provider),
+                s.insights
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.branch.as_deref())
+                    .unwrap_or("branch unknown")
+            )
+        })
+        .unwrap_or_default();
+    let block = border_block(&mode).title_bottom(sanitize(&context, 200));
     let inner = block.inner(area);
     let content = app.managed_text.clone().unwrap_or_else(|| {
         Text::from(
@@ -1547,7 +1616,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         if app.terminal_input {
             "INPUT → owned terminal · Ctrl+] returns to list · Ctrl-C goes to the program"
         } else {
-            "↑↓/jk choose · Enter/i type in terminal · q detach (program keeps running) · ? help"
+            "↑↓/jk choose · Enter/i type in terminal · H handoff · N inbox · q detach · ? help"
         }
     } else if app.show_preview {
         if area.width < 72 {
@@ -1558,7 +1627,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if area.width < 72 {
         "j/k · ←/→ tree · Space fold · Enter focus · ?"
     } else {
-        "↑↓/jk move   Space fold   Enter focus   c conversation   p preview   d evidence   b processes   / search   ?"
+        "↑↓/jk move   Space fold   Enter focus   c conversation   p preview   H handoff   N inbox   / search   ?"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(SLATE))).alignment(Alignment::Center),
@@ -1601,6 +1670,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Enter        Open its terminal; children without one use their parent"),
         Line::from("Enter / i    Owned terminal: enter INPUT mode in the right pane"),
         Line::from("Ctrl+]       Leave INPUT mode; q in the list detaches"),
+        Line::from("H / N        Reviewed handoff / attention inbox"),
         Line::from("p            Read-only terminal preview; PageUp/PageDown scroll"),
         Line::from("d            Full details; arrows/PageUp/PageDown scroll"),
         Line::from("/            Search sessions"),
@@ -1837,6 +1907,67 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(picker) = app.ghostty_picker.as_ref() {
         render_ghostty_picker(frame, area, picker);
     }
+    if app.show_inbox {
+        render_inbox(frame, area, app);
+    }
+    if let Some(view) = &app.handoff {
+        view.draw(frame, area, app.notice.as_deref());
+    }
+}
+
+fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(94, 86, area);
+    frame.render_widget(Clear, popup);
+    let now = chrono::Utc::now().timestamp();
+    let rows: Vec<_> = app
+        .attention
+        .iter()
+        .map(|item| {
+            let label = if now.saturating_sub(item.observed_at) > 300 {
+                format!(
+                    "Reminder ({}m ago)",
+                    now.saturating_sub(item.observed_at) / 60
+                )
+            } else {
+                item.kind.label().to_owned()
+            };
+            Row::new(vec![
+                label,
+                sanitize(item.title.as_deref().unwrap_or(&item.session_id), 80),
+                item.provider.label().to_owned(),
+                if item.is_snoozed(now) {
+                    "Snoozed".into()
+                } else if item.read_at.is_some() {
+                    "Read".into()
+                } else {
+                    "New".into()
+                },
+            ])
+        })
+        .collect();
+    let block = border_block(
+        "Attention · observed events only; a finished response is not a verified task",
+    )
+    .title_bottom("↑↓ select · Enter terminal · m acknowledge · z snooze 10m · N/Esc close");
+    if rows.is_empty() {
+        frame.render_widget(Paragraph::new("No open observed events. Claude hooks provide evidence; unavailable provider states are not inferred.").block(block).wrap(Wrap{trim:true}),popup);
+    } else {
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(22),
+                Constraint::Min(10),
+                Constraint::Length(9),
+                Constraint::Length(8),
+            ],
+        )
+        .block(block)
+        .row_highlight_style(Style::default().bg(SLATE_DARK))
+        .highlight_symbol("› ");
+        let mut state = TableState::default()
+            .with_selected(Some(app.inbox_selected.min(app.attention.len() - 1)));
+        frame.render_stateful_widget(table, popup, &mut state);
+    }
 }
 
 #[cfg(test)]
@@ -2069,10 +2200,13 @@ mod tests {
         assert_eq!(rows[0].child_count, 2);
         assert_eq!(role_label(rows[0].session, rows[0].child_count), "Parent");
         assert_eq!(role_label(rows[1].session, rows[1].child_count), "Subagent");
-        assert_eq!(tree_workspace_label(&rows[0]), "▾ ttybird  (2 children)");
+        assert_eq!(
+            tree_workspace_label(&rows[0]),
+            "▾ ttybird  (2 recorded children; 2 working?)"
+        );
         assert_eq!(
             tree_workspace_label(&rows[1]),
-            "├─ ▾ […11111111]  (1 child)"
+            "├─ ▾ […11111111]  (1 recorded child; 1 working?)"
         );
         assert_eq!(tree_workspace_label(&rows[2]), "│  └─ […33333333]");
         assert_eq!(tree_workspace_label(&rows[3]), "└─ z-worktree  […22222222]");
@@ -2343,6 +2477,10 @@ mod tests {
             .collect();
         assert_eq!(ids, HashSet::from(["parent", "working", "waiting"]));
         assert_eq!(app.tree_rows()[0].child_count, 5);
+        assert_eq!(app.tree_rows()[0].working_children, 1);
+        assert!(
+            tree_workspace_label(&app.tree_rows()[0]).contains("5 recorded children; 1 working?")
+        );
         assert!(rendered(&mut app, 200, 32).contains("3 retained children hidden (b)"));
 
         app.show_background = true;

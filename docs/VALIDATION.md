@@ -16,6 +16,7 @@ cargo build --release --locked --bin ttybird
 LC_ALL=C cargo test --release --locked --test tmux_preview -- --ignored
 python3 scripts/liveness_smoke.py target/release/ttybird
 python3 scripts/managed_smoke.py target/release/ttybird
+python3 scripts/handoff_smoke.py target/release/ttybird
 python3 scripts/tui_smoke.py target/release/ttybird
 LC_ALL=C python3 scripts/tmux_preview_smoke.py target/release/ttybird --gemini
 # macOS only; uses an osascript stub, never focuses a real pane:
@@ -38,6 +39,9 @@ explicitly; CI runs it in addition to the ordinary suite.
 | tmux preview | Real private pane; colors/Unicode/CR/erase, alternate screen, wrong identity, unchanged pane/buffers | Arbitrary tmux versions and remote capture |
 | Dashboard | Real PTY, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings, preview close/reopen | Exhaustive terminal emulators/keymaps |
 | Owned terminals | Real PTY + libghostty screen, explicit input/paste and Ctrl-C, Ctrl+] returning to the list, detach/reconnect, resize, private IPC, no screen persistence, stop cleanup | Every coding CLI, nested job-control programs, mouse/graphics, recovery after daemon/host failure |
+| Workspace metadata | Temporary real Git repositories, dirty/untracked paths, subdirectories, symlinks, detached HEAD, linked worktrees, caching and truncation | Network remotes, submodule contents, semantic meaning of a change |
+| Attention inbox | Synthetic observed hook transitions, sustained-event deduplication, read/acknowledge/snooze, stale expiry, restart deduplication and failed-delivery backoff with a fake notifier | A real desktop notification daemon, provider states without hook evidence, task completion |
+| Reviewed handoff | Temporary checkout, explicit note selection, private draft round-trip, credential/outside-path rejection, checkout drift rejection, real PTY review/edit/cancel, synthetic Codex argv/cwd/private-file delivery and stop cleanup | Model readiness/quality, automatic summarization, or an unreviewed external handoff |
 | Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection, exact-ID focus invocation, failed-focus binding rollback, dashboard retained after picker/saved focus, q restoration | A GUI end-to-end focus test on every Ghostty version |
 | SSH collector | Fixed command, versioned protocol, invalid destination rejection, bounded child execution | Authenticated multi-host network test |
 | Release portability | CI-native build and library reference check, version execution before packaging | Notarization, signing, all macOS/Linux versions |
@@ -54,6 +58,14 @@ Each dashboard must exit within two seconds and leave no fixture process group.
 The restoration checks compare configurable termios fields and mutable file
 status flags; macOS `PENDIN` and the kernel's `FWASWRITTEN` bookkeeping are not
 configuration leaks. Fixtures never send input to real agent terminals.
+
+Attention tests replace the desktop transport with a fake and make no provider
+or model call. They verify that `PermissionRequest` and allowlisted notification
+subtypes remain distinct evidence, while `PreToolUse` remains ordinary tool
+execution. Notification command construction uses direct argv; the automated
+suite does not display a real OS notification. Handoff preparation tests likewise
+use local files and Git metadata only. They do not launch Codex or establish the
+quality of a reviewed draft.
 
 ## Optional real Ghostty GUI check
 

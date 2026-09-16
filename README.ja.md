@@ -105,6 +105,8 @@ Ghosttyの初回紐付けは親に一度だけ行います。子自身の会話�
 | p | ローカルtmuxのプレビュー。PageUp/PageDownで表示範囲を移動 |
 | c | 直近のローカル会話を表示。Escで閉じる |
 | d / / | 技術的な詳細 / タイトルなどを検索 |
+| H | 引き継ぎ案を作成・確認してから新しいCodexセッションを開始 |
+| N | 観測済みイベントの受信箱。`m`で確認済み、`z`で10分間スヌーズ |
 | a | 観測できた入力待ちに絞る |
 | b / h | 保持された子・バックグラウンドプロセス / 履歴を表示 |
 | r / ? | 更新 / ヘルプ |
@@ -112,6 +114,46 @@ Ghosttyの初回紐付けは親に一度だけ行います。子自身の会話�
 
 スクリプトには`--plain`、`--json`、`--watch --json`を使えます。
 `ttybird doctor`で実行環境、`ttybird providers`で対応能力を確認できます。
+
+## ワークスペース・通知・確認付き引き継ぎ
+
+Git checkout内のセッションには、checkout/worktree、branchまたはdetached HEAD、
+commit、dirty状態を表示します。Gitの調査は読み取り専用かつ時間・出力量を制限し、
+任意lockを無効にします。変更内容のdiffは読まず、変更されたpathのmetadataだけを
+扱います。同じrepositoryを共有するlinked worktreeも別のcheckoutとして表示します。
+
+**N** で永続化されたattention inboxを開きます。対象は、任意のClaude hooksから
+直接観測した権限・入力要求、応答終了、tool失敗だけです。通常の`PreToolUse`はtoolの
+実行中を示すため、承認要求として扱いません。**m** で選択中の発生を確認済みにし、
+**z** で通知を10分後に延期します。既読の発生は現在のdesktop通知を抑制し、後から
+新しい観測が届けば別の発生として開きます。古い観測や到達不能なhostは「停止」と
+断定せず、期限切れにします。明示的にスヌーズした場合は過去の観測に基づくreminderを
+期限まで保持しますが、agentが今も待っているとは表示しません。CLIからも操作できます。
+
+```sh
+ttybird inbox
+ttybird inbox ack EVENT_ID
+ttybird inbox snooze EVENT_ID --minutes 10
+```
+
+desktop通知は既定で無効です。TUIまたはwatchに`--notify`を付けた場合だけ有効になり、
+event種別と制御文字を除去して短くしたtask titleだけを表示します。会話本文は含めません。
+配信は時間制限付きで、privateなconfig内の状態により重複を抑えます。要求の自動承認や
+agentへの入力は行いません。「応答終了」は1回の応答の観測で、task完了の証明ではありません。
+
+**H** で新しいTTYbird管理下のCodexセッションへ渡すdraftを作成・確認します。
+準備時にmodelは呼び出しません。checkout情報と変更pathのmetadata、および明示的に
+選んだnoteだけを含めます。直近会話の限定的な抜粋は指定した場合だけ追加します。
+privateなdraftを確認・編集してから開始してください。CLIでは次のように操作します。
+
+```sh
+ttybird handoff prepare [SESSION] --cwd PATH --note RELATIVE_PATH --include-conversation
+ttybird handoff start BUNDLE --yes --detach
+```
+
+`--yes`は確認したbundleそのものを開始する指定です。開始前にcheckout、branch、HEAD、
+dirty状態、変更pathのmetadataを再確認し、既存のローカルCodex設定で起動します。
+元のagentを停止したとは扱いません。
 
 ## タイトル・トークン・会話
 
@@ -153,3 +195,7 @@ SSHの登録、手動紐付け、任意hooks、開発コマンドは[英語READM
 [全テストの監査](docs/TEST-AUDIT.md)には、削除・統合の判断と残した保証を記録しています。
 不具合報告にはOS・端末・TTYbirdの版と匿名化した再現手順を添えてください。
 実際の会話ログや認証情報を公開しないでください。ライセンスはMITです。
+
+`Parent` は親子関係を表し、稼働中という意味ではありません。
+`3 recorded children; 0 working?` は記録された子が3件、作業中と推定される子が0件です。
+完了済み・待機中・状態不明の子も記録数には含みます。

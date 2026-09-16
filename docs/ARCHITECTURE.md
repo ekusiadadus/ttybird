@@ -31,9 +31,12 @@ flowchart LR
     P[Same-user process metadata] --> C[Local collector]
     L[Bounded Codex / Claude log samples] --> C
     H[Optional Claude lifecycle hooks] --> C
+    W[Bounded read-only Git metadata] --> C
     R[Registered SSH collectors] --> S[Versioned snapshots]
     C --> S
     S --> V[List / watch / JSON / needs-me]
+    H --> A[Durable observed attention inbox]
+    A --> D[Optional bounded desktop notification]
     B[Explicit binding + PID start time] --> N[Navigation]
     V --> N
     N --> G[Ghostty exact surface ID]
@@ -52,6 +55,9 @@ Session IDs and tree links are scoped by host and provider in the aggregated vie
 
 - `collect::collect`: local process/log snapshot.
 - `telemetry`: opt-in Claude event ingestion and enrichment; only allowlisted metadata is persisted.
+- `workspace`: bounded, read-only Git checkout/worktree identity, branch/HEAD and changed-path metadata; no diff content.
+- `attention`: observed hook occurrences, read/acknowledge/snooze state and optional bounded notification delivery. It has no approval or agent-input path.
+- `handoff`: private, user-reviewed context bundles and an explicit Codex launch after checkout identity is revalidated.
 - `remote`: allowlisted SSH destination/binary syntax, fixed collector command, protocol validation, bounded process execution.
 - `navigation`: Ghostty and tmux capabilities. No text/key injection API.
 - `config`: private files, atomic writes, explicit host/binding management.
@@ -66,6 +72,37 @@ Protocol 1 is JSON `Snapshot`. `collect` always returns one local snapshot. The 
 - [Codex App Server](https://learn.chatgpt.com/docs/app-server). Reviewed as a future adapter; not claimed as implemented.
 
 Raw local transcript layouts are implementation details and may change. Their adapters must remain conservative and tested against synthetic format fixtures.
+
+## Attention and reviewed handoff
+
+Attention state is separate from the process/session snapshot. An occurrence is
+keyed by host, provider, session, PID start identity and an occurrence counter.
+Only observed Claude hook evidence on an exact allowlist can open an item:
+permission/input requests, `Stop` as response-finished evidence, and tool
+failure. `PreToolUse` / `WaitingTool` means ordinary tool execution and never
+opens or notifies an approval item. Refreshing one sustained event does not
+create another occurrence; a later observed event or a transition through work
+does. Missing, stale or unreachable evidence expires without asserting that the
+agent stopped or the task completed. An explicit snooze may retain a historical
+reminder beyond evidence freshness, but its notification says that it is a
+reminder of an observed request rather than a confirmed current wait.
+
+Read, acknowledge, snooze and successful-notification state live in a private,
+atomically replaced config file guarded across TTYbird processes. Notification
+transports receive arguments directly without a shell, have a deadline and mark
+an occurrence notified only after successful transport. Failure uses persistent
+backoff. The payload is limited to provider/host, event type and a sanitized,
+truncated task title; transcript text, cwd and hook evidence are not sent. No
+attention action approves a tool call or writes to an agent terminal.
+
+Handoff preparation is local and deterministic; it does not call a model.
+Workspace identity and changed path metadata are included automatically. Note
+files must be explicitly selected, remain inside the checkout and pass size and
+credential-path restrictions. Conversation text is opt-in and bounded. The
+editable draft and manifest are private files. Starting requires explicit review
+confirmation, rechecks checkout/branch/HEAD plus dirty and changed-path
+metadata, and launches a new owned Codex session with the user's existing Codex
+defaults. The source session remains independent and is not treated as stopped.
 
 ## Optional terminal preview
 

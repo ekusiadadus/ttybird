@@ -1,5 +1,9 @@
 # Project rules
 
+Exception for user-requested handoff: an explicit handoff action may prepare a bounded draft from Git metadata, user-selected notes and optionally a revalidated plaintext conversation excerpt. Show the exact draft and destination before starting a new owned Codex session. Only a confirmed handoff may persist that content privately for the destination to read. Never copy credentials, hidden reasoning, tool arguments or source-provider permission settings. Tests launch synthetic destination programs, not models.
+
+Workspace inspection is read-only Git metadata. Attention notifications are opt-in, use observed lifecycle evidence, and persist only notification metadata/read/snooze state. A completed response is not proof that the task or review is complete.
+
 Preserve active agent sessions. Collection is read-only and must never send terminal input or approve agent actions. Focus/attach require an explicit CLI command. Never read credentials or print prompts, tool arguments, environment variables, or full command lines.
 
 Exception for user-requested managed terminals: `ttybird run -- COMMAND` explicitly launches a new, TTYbird-owned PTY. Its bounded screen state may be kept in daemon memory across dashboard detach, but never persisted or included in collection JSON. Only explicit input mode may forward keys/paste to that owned session; `stop ID` may terminate that owned process group. Existing discovered terminals must never receive input through this feature. Tests use synthetic commands only.

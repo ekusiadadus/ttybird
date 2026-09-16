@@ -115,11 +115,17 @@ viewer resize applies. Embedded mouse input and terminal graphics are not suppor
 | p | Toggle local tmux preview; PageUp/PageDown scroll the captured screen |
 | c | Recent local Codex/Claude messages, only when requested; Esc closes |
 | d | Full metadata and evidence |
+| H | Prepare and review a handoff before starting a new Codex session |
+| N | Open the observed attention inbox; `m` acknowledges and `z` snoozes 10 minutes |
 | / | Search title, workspace, provider, host or session |
 | a | Only observed requests needing input |
 | b / h | Show retained children, auxiliary and background processes / recent log-only history |
 | r / ? | Refresh / keyboard help |
 | q / Ctrl-C | Exit and restore the terminal |
+
+`Parent` describes a relationship, not active work. For example,
+`3 recorded children; 0 working?` includes completed/idle/unknown children;
+the second count is only the children currently inferred to be working.
 
 For a child without its own terminal, Enter opens its **recorded parent's**
 terminal. Only the parent needs the initial Ghostty mapping. `c` still opens the
@@ -128,6 +134,55 @@ selected child's conversation; the status line states the Enter destination.
 Piped output is plain text by default. Use `--plain`, `--json`, or
 `--watch --json` (JSONL) explicitly for scripts. `ttybird doctor` checks runtime
 tools and `ttybird providers` reports adapter capabilities.
+
+## Workspaces, attention and reviewed handoff
+
+For sessions inside a Git checkout, TTYbird shows the checkout/worktree,
+branch or detached HEAD, commit and dirty state. Inspection is read-only and
+bounded; it disables optional Git locks and records changed path metadata, not
+diff contents. Linked worktrees that share one repository remain distinct
+checkouts.
+
+Press **N** for the durable attention inbox. It accepts only current, observed
+Claude hook evidence for permission/input requests, response completion and
+tool failure. A normal `PreToolUse` event means a tool is running and is not an
+approval request. **m** acknowledges the selected occurrence; **z** postpones
+its reminder for 10 minutes. Reading an occurrence suppresses its current
+desktop reminder, while a later observed occurrence opens a new item. A stale
+or unreachable observation expires instead of being reported as stopped. An
+explicit snooze keeps only a historical reminder until it is due; it does not
+claim that the agent is still waiting. The same operations are available
+without the TUI:
+
+```sh
+ttybird inbox
+ttybird inbox ack EVENT_ID
+ttybird inbox snooze EVENT_ID --minutes 10
+```
+
+Desktop notification delivery is off by default. Add `--notify` to the TUI or
+watch mode to enable it. Notifications contain the event type and a sanitized,
+truncated task title, never a transcript. Delivery is bounded and deduplicated
+in the private config directory. It does not approve a request or send input to
+an agent. “Response finished” describes one observed response; it does not prove
+that the task is complete.
+
+Press **H** to prepare and review a handoff to a new TTYbird-owned Codex session.
+Preparation makes no model call. The draft contains checkout identity and
+changed path metadata plus only the note files you select; a bounded recent
+conversation excerpt is included only when explicitly requested. Review and
+edit the private draft before starting it. The CLI form is:
+
+```sh
+ttybird handoff prepare [SESSION] --cwd PATH --note RELATIVE_PATH --include-conversation
+ttybird handoff start BUNDLE --yes --detach
+```
+
+Use `--yes` only after reviewing the current `draft.md`; it is your explicit
+confirmation to share that file. Omit it for an interactive review prompt.
+Starting rechecks checkout, branch, HEAD and changed-path metadata, then launches
+Codex with the existing local Codex defaults. File contents remain live.
+The handoff does not stop or claim ownership of the source agent.
 
 ## What is actually observed
 

@@ -43,12 +43,35 @@ pub fn activity(value: &serde_json::Value) -> Option<Activity> {
         "SessionStart" | "Stop" => Some(Activity::Idle),
         "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" => Some(Activity::Working),
         "PreToolUse" => Some(Activity::WaitingTool),
+        "PermissionRequest" => Some(Activity::WaitingInput),
         "SessionEnd" => Some(Activity::Ended),
         "Notification" if value["notification_type"] == "permission_prompt" => {
             Some(Activity::WaitingInput)
         }
         "Notification" if value["notification_type"] == "idle_prompt" => Some(Activity::Idle),
+        "Notification"
+            if matches!(
+                value["notification_type"].as_str(),
+                Some("elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input")
+            ) =>
+        {
+            Some(Activity::WaitingInput)
+        }
         _ => None,
+    }
+}
+
+fn event_evidence(value: &serde_json::Value) -> String {
+    if value["hook_event_name"] == "Notification" {
+        format!(
+            "Notification:{}",
+            value["notification_type"].as_str().unwrap_or("unknown")
+        )
+    } else {
+        value["hook_event_name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string()
     }
 }
 
@@ -96,10 +119,7 @@ pub fn record(dir: &Path, input: impl Read) -> Result<()> {
         process_started_at,
         cwd: value["cwd"].as_str().map(str::to_string),
         activity,
-        event: value["hook_event_name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string(),
+        event: event_evidence(&value),
         timestamp: chrono::Utc::now().timestamp(),
     };
     config::atomic_write(
@@ -184,6 +204,8 @@ fn merge_observation(existing: &mut Session, mut observed: Session) {
     if existing.pid == observed.pid && existing.process_started_at == observed.process_started_at {
         observed.tty = existing.tty.clone();
         observed.target = existing.target.clone();
+        observed.insights = existing.insights.clone();
+        observed.parent_id = existing.parent_id.clone();
     }
     observed.model = existing.model.clone();
     *existing = observed;
@@ -195,26 +217,48 @@ mod tests {
     #[test]
     fn resumed_hook_never_inherits_another_process_terminal() {
         let old:Session=serde_json::from_value(serde_json::json!({"id":"session","provider":"claude","parent_id":null,"host":"local","pid":10,"process_started_at":100,"tty":"/dev/pts/1","cwd":null,"model":"fixture","activity":"unknown","confidence":"observed","evidence":"fixture","updated_at":null,"target":{"kind":"tmux","socket":null,"pane":"%1"}})).unwrap();
+        let mut old = old;
+        old.parent_id = Some("parent-session".to_owned());
+        old.insights.title = Some("Preserved task title".to_owned());
         let mut new = old.clone();
         new.pid = Some(20);
         new.process_started_at = Some(200);
         new.tty = None;
         new.target = None;
+        new.parent_id = None;
+        new.insights = Default::default();
         let mut merged = old.clone();
         merge_observation(&mut merged, new);
         assert_eq!(merged.pid, Some(20));
         assert!(merged.tty.is_none());
         assert!(merged.target.is_none());
+        assert!(merged.parent_id.is_none());
+        assert!(merged.insights.title.is_none());
         let mut same = old.clone();
         same.tty = None;
         same.target = None;
+        same.parent_id = None;
+        same.insights = Default::default();
         let mut merged = old;
         merge_observation(&mut merged, same);
         assert_eq!(merged.tty.as_deref(), Some("/dev/pts/1"));
         assert!(merged.target.is_some());
+        assert_eq!(merged.parent_id.as_deref(), Some("parent-session"));
+        assert_eq!(
+            merged.insights.title.as_deref(),
+            Some("Preserved task title")
+        );
     }
     #[test]
-    fn only_explicit_permission_notification_waits_for_input() {
+    fn permission_requests_are_distinct_from_tools_running() {
+        assert_eq!(
+            activity(&serde_json::json!({"hook_event_name":"PermissionRequest"})),
+            Some(Activity::WaitingInput)
+        );
+        assert_eq!(
+            activity(&serde_json::json!({"hook_event_name":"PreToolUse"})),
+            Some(Activity::WaitingTool)
+        );
         assert_eq!(
             activity(
                 &serde_json::json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})
@@ -230,6 +274,29 @@ mod tests {
         assert_eq!(
             activity(&serde_json::json!({"hook_event_name":"SubagentStop"})),
             None
+        );
+    }
+    #[test]
+    fn notification_subtype_is_retained_as_attention_evidence() {
+        for notification_type in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
+        ] {
+            let payload = serde_json::json!({
+                "hook_event_name": "Notification",
+                "notification_type": notification_type,
+            });
+            assert_eq!(
+                event_evidence(&payload),
+                format!("Notification:{notification_type}")
+            );
+            assert_eq!(activity(&payload), Some(Activity::WaitingInput));
+        }
+        assert_eq!(
+            event_evidence(&serde_json::json!({"hook_event_name":"Stop"})),
+            "Stop"
         );
     }
     #[test]

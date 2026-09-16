@@ -1,5 +1,8 @@
+pub mod attention;
 pub mod collect;
 pub mod config;
+pub mod handoff;
+pub mod handoff_view;
 pub mod managed;
 pub mod managed_view;
 pub mod managed_vt;
@@ -11,3 +14,5 @@ pub mod remote;
 pub mod telemetry;
 pub mod terminal_preview;
 pub mod ui;
+pub mod workflow;
+pub mod workspace;

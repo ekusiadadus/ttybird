@@ -204,6 +204,8 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
                 .contains(&snapshot.collected_at.saturating_sub(timestamp))
         });
         let insights = SessionInsights {
+            workspace: None,
+            sharing: None,
             title: if log.provider == Provider::Codex {
                 codex_titles.get(&id).cloned().or(parsed.title)
             } else {

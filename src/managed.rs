@@ -72,9 +72,19 @@ pub enum Response {
 }
 
 pub fn launch(config_dir: &Path, name: Option<&str>, command: &[String]) -> Result<SessionInfo> {
+    launch_at(config_dir, name, command, None)
+}
+
+/// Launch in an explicit workspace without changing the dashboard's cwd.
+pub fn launch_at(
+    config_dir: &Path,
+    name: Option<&str>,
+    command: &[String],
+    cwd: Option<&Path>,
+) -> Result<SessionInfo> {
     #[cfg(not(unix))]
     {
-        let _ = (config_dir, name, command);
+        let _ = (config_dir, name, command, cwd);
         bail!("managed terminal sessions require Unix")
     }
     #[cfg(unix)]
@@ -85,9 +95,12 @@ pub fn launch(config_dir: &Path, name: Option<&str>, command: &[String]) -> Resu
         let socket = socket_path(&dir, &id)?;
         let executable = std::env::current_exe().context("locate the ttybird executable")?;
         let mut daemon = Command::new(executable);
+        if let Some(cwd) = cwd {
+            daemon.current_dir(cwd);
+        }
         daemon
             .arg("--config-dir")
-            .arg(config_dir)
+            .arg(fs::canonicalize(config_dir)?)
             .arg("__session-server")
             .arg(&id);
         if let Some(name) = name {

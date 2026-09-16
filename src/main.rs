@@ -38,6 +38,9 @@ struct Cli {
     /// Query only this computer; never connects over SSH.
     #[arg(long, global = true)]
     local: bool,
+    /// Enable desktop notifications from observed attention events while running.
+    #[arg(long, global = true)]
+    notify: bool,
     /// Hide recent logs that could not be associated with a live process.
     #[arg(long, global = true)]
     live_only: bool,
@@ -54,6 +57,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
+    /// Prepare, review and explicitly share a task handoff with a new Codex session.
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
+    /// Read, acknowledge or snooze the observed attention inbox.
+    Inbox {
+        #[command(subcommand)]
+        command: Option<InboxCommand>,
+    },
     /// Start an owned terminal. Its program survives closing the dashboard.
     Run {
         #[arg(long)]
@@ -143,6 +156,38 @@ enum HostCommand {
     List,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+enum HandoffCommand {
+    Prepare {
+        session: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        note: Vec<PathBuf>,
+        #[arg(long)]
+        include_conversation: bool,
+    },
+    Start {
+        bundle: PathBuf,
+        /// Confirm that you reviewed this exact draft and want to share it with Codex.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        detach: bool,
+    },
+}
+#[derive(Subcommand, Debug, Clone)]
+enum InboxCommand {
+    Ack {
+        id: String,
+    },
+    Snooze {
+        id: String,
+        #[arg(long, default_value_t=10, value_parser=clap::value_parser!(u64).range(1..=1440))]
+        minutes: u64,
+    },
+}
+
 fn options(cli: &Cli) -> CollectOptions {
     CollectOptions {
         recent_minutes: cli.recent_minutes,
@@ -187,6 +232,7 @@ fn local_snapshot(cli: &Cli, dir: &std::path::Path) -> Result<Snapshot> {
             .warnings
             .push(format!("Owned terminals unavailable: {error}"));
     }
+    ttybird::workflow::enrich_workspaces(&mut snapshot);
     Ok(snapshot)
 }
 
@@ -792,6 +838,45 @@ fn terminal_gone_error(error: &io::Error) -> bool {
     false
 }
 
+type AttentionItems = Vec<ttybird::attention::AttentionItem>;
+fn open_inbox(dir: &std::path::Path) -> Result<AttentionItems> {
+    Ok(ttybird::attention::AttentionInbox::new(dir)
+        .items(chrono::Utc::now().timestamp())?
+        .into_iter()
+        .filter(|item| item.is_open())
+        .collect())
+}
+fn refresh_with_inbox(cli: &Cli, dir: &std::path::Path) -> Result<(Vec<Snapshot>, AttentionItems)> {
+    let mut snapshots = all_snapshots(cli, dir)?;
+    let inbox = ttybird::attention::AttentionInbox::new(dir);
+    let now = chrono::Utc::now().timestamp();
+    let result = inbox.update(&snapshots, now).and_then(|update| {
+        if cli.notify {
+            let report = inbox.notify_pending(now)?;
+            if report.failed > 0 && let Some(local) = snapshots.first_mut() {
+                local.warnings.push(format!("{} desktop notifications failed; retries use backoff. Check OS notification permissions and delivery tools.", report.failed));
+            }
+        }
+        Ok(update
+            .items
+            .into_iter()
+            .filter(|item| item.is_open())
+            .collect())
+    });
+    let items = match result {
+        Ok(items) => items,
+        Err(error) => {
+            if let Some(local) = snapshots.first_mut() {
+                local
+                    .warnings
+                    .push(format!("Attention inbox unavailable: {error}"));
+            }
+            Vec::new()
+        }
+    };
+    Ok((snapshots, items))
+}
+
 fn interactive(
     cli: &Cli,
     dir: &std::path::Path,
@@ -821,13 +906,14 @@ fn interactive(
     let mut owned_frame_busy = false;
     let mut owned_next_frame = Instant::now();
     let (requests, work) = mpsc::sync_channel::<()>(1);
-    let (results, ready) = mpsc::sync_channel::<std::result::Result<Vec<Snapshot>, String>>(1);
+    let (results, ready) =
+        mpsc::sync_channel::<std::result::Result<(Vec<Snapshot>, AttentionItems), String>>(1);
     let worker_cli = cli.clone();
     let worker_dir = dir.to_path_buf();
     // One collector at a time. The UI never waits on SSH or process inspection.
     std::thread::spawn(move || {
         while work.recv().is_ok() {
-            let result = all_snapshots(&worker_cli, &worker_dir).map_err(|e| format!("{e:#}"));
+            let result = refresh_with_inbox(&worker_cli, &worker_dir).map_err(|e| format!("{e:#}"));
             if results.send(result).is_err() {
                 break;
             }
@@ -867,10 +953,61 @@ fn interactive(
         mpsc::Receiver<std::result::Result<String, String>>,
     )> = None;
     let mut conversation_key: Option<String> = None;
+    enum HandoffResult {
+        Draft(Box<ttybird::handoff::Draft>, Box<Session>),
+        Conversation(String),
+        Saved(PathBuf),
+        Started(String),
+    }
+    let mut handoff_query: Option<mpsc::Receiver<std::result::Result<HandoffResult, String>>> =
+        None;
     let mut redraw = true;
     while running.load(Ordering::SeqCst) {
         if terminal_disconnected()? {
             break;
+        }
+        if let Some(result) = handoff_query.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            handoff_query = None;
+            redraw = true;
+            match result {
+                Ok(HandoffResult::Draft(draft, source)) => {
+                    app.handoff = Some(ttybird::handoff_view::View::new(*draft, Some(*source)));
+                    app.notice = None;
+                }
+                Ok(HandoffResult::Conversation(excerpt)) => {
+                    if let Some(view) = &mut app.handoff {
+                        match ttybird::handoff::add_conversation(&mut view.draft, &excerpt) {
+                            Ok(()) => {
+                                view.conversation_added = true;
+                                app.notice =
+                                    Some("Excerpt added. Review it before sharing.".into());
+                            }
+                            Err(error) => app.notice = Some(error.to_string()),
+                        }
+                    }
+                }
+                Ok(HandoffResult::Saved(path)) => {
+                    app.notice = Some(format!(
+                        "Private draft saved: {}",
+                        clean(&path.to_string_lossy())
+                    ))
+                }
+                Ok(HandoffResult::Started(id)) => {
+                    app.handoff = None;
+                    app.show_conversation = false;
+                    app.show_preview = false;
+                    initial_managed = Some(id);
+                    app.notice = Some(
+                        "Codex started with your reviewed handoff. Source session was not stopped."
+                            .into(),
+                    );
+                    if !app.refreshing && requests.try_send(()).is_ok() {
+                        app.refreshing = true;
+                        last_request = Instant::now();
+                    }
+                }
+                Err(error) => app.notice = Some(format!("Handoff: {}", clean(&error))),
+            }
         }
         if let Some(result) = focus_query.as_ref().and_then(|rx| rx.try_recv().ok()) {
             focus_query = None;
@@ -954,7 +1091,10 @@ fn interactive(
                 continue;
             }
             match result {
-                Ok(snapshots) => app.set_snapshots(snapshots),
+                Ok((snapshots, items)) => {
+                    app.set_snapshots(snapshots);
+                    app.attention = items;
+                }
                 Err(error) => {
                     // Discard queries carrying a frozen pre-failure process
                     // identity and reject any in-flight preview response.
@@ -1045,6 +1185,8 @@ fn interactive(
             && !app.show_conversation
             && !app.show_details
             && !app.show_help
+            && app.handoff.is_none()
+            && !app.show_inbox
             && let Some(id) = app.managed_id.as_deref()
         {
             let size = terminal.size()?;
@@ -1084,9 +1226,11 @@ fn interactive(
             && app.managed_id.is_none()
             && !app.liveness_unavailable
             && app.ghostty_picker.is_none()
-            && pane_query.is_none())
-        .then(|| app.selected_session().cloned())
-        .flatten();
+            && pane_query.is_none()
+            && app.handoff.is_none()
+            && !app.show_inbox)
+            .then(|| app.selected_session().cloned())
+            .flatten();
         let selected_is_local = app.selected_session().is_some_and(|selected| {
             app.snapshots.first().is_some_and(|snapshot| {
                 snapshot
@@ -1227,6 +1371,46 @@ fn interactive(
             }
             continue;
         }
+        if app.handoff.is_some() {
+            // Freeze the reviewed draft while saving/launching; a late excerpt
+            // cannot be applied to a different handoff.
+            if handoff_query.is_some() {
+                continue;
+            }
+            use ttybird::handoff_view::Action;
+            let action = app.handoff.as_mut().unwrap().event(input_event);
+            match action {
+                Action::Close => app.handoff = None,
+                Action::None => {}
+                action => {
+                    let view = app.handoff.as_ref().unwrap();
+                    let draft = view.draft.clone();
+                    let source = view.source.clone();
+                    let path = dir.to_path_buf();
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    handoff_query = Some(rx);
+                    app.notice = Some("Preparing handoff action…".into());
+                    std::thread::spawn(move || {
+                        let result = match action {
+                            Action::Save => {
+                                ttybird::handoff::save(&path, &draft).map(HandoffResult::Saved)
+                            }
+                            Action::Start => ttybird::handoff::start(&path, &draft)
+                                .map(|s| HandoffResult::Started(s.id)),
+                            Action::Conversation => source
+                                .as_ref()
+                                .context("No verified source session")
+                                .and_then(collect::recent_conversation)
+                                .map(HandoffResult::Conversation),
+                            _ => unreachable!(),
+                        }
+                        .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(result);
+                    });
+                }
+            }
+            continue;
+        }
         let Event::Key(key) = input_event else {
             continue;
         };
@@ -1235,6 +1419,85 @@ fn interactive(
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             break;
+        }
+        if app.show_inbox {
+            let now = chrono::Utc::now().timestamp();
+            let inbox = ttybird::attention::AttentionInbox::new(dir);
+            let item = app.attention.get(app.inbox_selected).cloned();
+            let mut enter_session = None;
+            let result = match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('N') => {
+                    app.show_inbox = false;
+                    Ok(())
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.inbox_selected =
+                        (app.inbox_selected + 1).min(app.attention.len().saturating_sub(1));
+                    Ok(())
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.inbox_selected = app.inbox_selected.saturating_sub(1);
+                    Ok(())
+                }
+                KeyCode::Char('m') => item
+                    .as_ref()
+                    .map_or(Ok(()), |i| inbox.acknowledge(&i.id, now).map(|_| ())),
+                KeyCode::Char('z') => item
+                    .as_ref()
+                    .map_or(Ok(()), |i| inbox.snooze(&i.id, now + 600).map(|_| ())),
+                KeyCode::Enter => {
+                    if let Some(item) = item {
+                        enter_session = app
+                            .snapshots
+                            .iter()
+                            .flat_map(|s| &s.sessions)
+                            .find(|s| {
+                                s.host == item.host
+                                    && s.provider == item.provider
+                                    && s.id == item.session_id
+                                    && s.pid == Some(item.pid)
+                                    && s.process_started_at == Some(item.process_started_at)
+                            })
+                            .cloned();
+                        if enter_session.is_none() {
+                            app.notice = Some(
+                                "That event has no currently verified session to open.".into(),
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                app.notice = Some(error.to_string());
+            }
+            if let Ok(items) = open_inbox(dir) {
+                app.attention = items;
+                app.inbox_selected = app
+                    .inbox_selected
+                    .min(app.attention.len().saturating_sub(1));
+            }
+            if let Some(session) = enter_session {
+                app.show_inbox = false;
+                app.needs_only = false;
+                app.query.clear();
+                app.show_background = true;
+                app.collapsed.clear();
+                app.restore_selection(Some(&session));
+                if app
+                    .selected_session()
+                    .is_none_or(|s| s.id != session.id || s.host != session.host)
+                {
+                    app.notice = Some(
+                        "Session is in a folded branch; expand it to open its terminal.".into(),
+                    );
+                    continue;
+                }
+                // Continue into the ordinary, revalidated Enter path.
+            } else {
+                continue;
+            }
         }
         if app.ghostty_picker.is_some() {
             match key.code {
@@ -1350,6 +1613,56 @@ fn interactive(
                 app.query.clear();
                 app.notice = None;
                 app.restore_selection(previous_selection.as_ref());
+            }
+            KeyCode::Char('N') => {
+                let inbox = ttybird::attention::AttentionInbox::new(dir);
+                match inbox
+                    .mark_all_read(chrono::Utc::now().timestamp())
+                    .and_then(|_| open_inbox(dir))
+                {
+                    Ok(items) => {
+                        app.attention = items;
+                        app.inbox_selected = 0;
+                        app.show_inbox = true;
+                    }
+                    Err(error) => app.notice = Some(format!("Inbox: {error}")),
+                }
+            }
+            KeyCode::Char('H') => {
+                if handoff_query.is_some() {
+                    app.notice = Some("A handoff action is still running.".into());
+                    continue;
+                }
+                let source = app.selected_session().cloned();
+                if let Some(source) = source {
+                    if app.snapshots.first().is_none_or(|s| s.host != source.host) {
+                        app.notice = Some("Prepare a handoff on the source host; remote file reads are not supported.".into());
+                        continue;
+                    }
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    handoff_query = Some(rx);
+                    app.notice =
+                        Some("Preparing metadata-only draft; conversation is opt-in.".into());
+                    std::thread::spawn(move || {
+                        let result = source
+                            .cwd
+                            .as_deref()
+                            .context("No workspace recorded")
+                            .and_then(|cwd| {
+                                ttybird::handoff::prepare(
+                                    Some(&source),
+                                    std::path::Path::new(cwd),
+                                    &[],
+                                    None,
+                                )
+                            })
+                            .map(|draft| HandoffResult::Draft(Box::new(draft), Box::new(source)))
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(result);
+                    });
+                } else {
+                    app.notice = Some("Select a local session to prepare a handoff, or use handoff prepare --cwd PATH.".into());
+                }
             }
             KeyCode::Char('?') => app.show_help = true,
             KeyCode::Char('p') => {
@@ -1553,6 +1866,102 @@ fn should_open_tui(cli: &Cli, input_is_terminal: bool, output_is_terminal: bool)
     !cli.json && !cli.plain && input_is_terminal && output_is_terminal
 }
 
+fn handoff_command(cli: &Cli, dir: &std::path::Path, command: &HandoffCommand) -> Result<()> {
+    match command {
+        HandoffCommand::Prepare {
+            session,
+            cwd,
+            note,
+            include_conversation,
+        } => {
+            let source = if let Some(id) = session {
+                Some(find_session(&local_snapshot(cli, dir)?, id)?.clone())
+            } else {
+                None
+            };
+            if *include_conversation && source.is_none() {
+                bail!("--include-conversation requires a verified local SESSION");
+            }
+            let cwd = cwd
+                .clone()
+                .or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|s| s.cwd.as_deref().map(PathBuf::from))
+                })
+                .unwrap_or(std::env::current_dir()?);
+            let excerpt = if *include_conversation {
+                Some(collect::recent_conversation(source.as_ref().unwrap())?)
+            } else {
+                None
+            };
+            let draft = ttybird::handoff::prepare(source.as_ref(), &cwd, note, excerpt.as_deref())?;
+            let bundle = ttybird::handoff::save(dir, &draft)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"bundle":bundle,"destination":"codex","started":false})
+                );
+            } else {
+                println!(
+                    "Draft saved to {}
+Edit draft.md, then review and start with: ttybird handoff start <bundle>",
+                    clean(&bundle.display().to_string())
+                );
+            }
+        }
+        HandoffCommand::Start {
+            bundle,
+            yes,
+            detach,
+        } => {
+            if !detach
+                && (cli.json
+                    || cli.plain
+                    || !io::stdin().is_terminal()
+                    || !io::stdout().is_terminal())
+            {
+                bail!("use --detach to start without an interactive dashboard");
+            }
+            let draft = ttybird::handoff::read(bundle)?;
+            if !yes {
+                if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                    bail!(
+                        "review draft.md, then pass --yes to explicitly share this draft with Codex"
+                    );
+                }
+                println!(
+                    "Destination: Codex in {}
+
+{}
+",
+                    clean(&draft.workspace.checkout_root.display().to_string()),
+                    ttybird::handoff::clean(&draft.text)
+                );
+                print!("Share this draft and start a new Codex session? Type yes: ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if answer.trim() != "yes" {
+                    println!("Cancelled; no session started.");
+                    return Ok(());
+                }
+            }
+            let session = ttybird::handoff::start(dir, &draft)?;
+            if *detach {
+                if cli.json {
+                    println!("{}", serde_json::to_string(&session)?);
+                } else {
+                    println!("{}", session.id);
+                }
+            } else {
+                interactive(cli, dir, false, Some(&session.id))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli
@@ -1561,6 +1970,46 @@ fn run() -> Result<()> {
         .map(Ok)
         .unwrap_or_else(config::directory)?;
     match &cli.command {
+        Some(Commands::Handoff { command }) => handoff_command(&cli, &dir, command)?,
+        Some(Commands::Inbox { command }) => {
+            let inbox = ttybird::attention::AttentionInbox::new(&dir);
+            let now = chrono::Utc::now().timestamp();
+            match command {
+                Some(InboxCommand::Ack { id }) => {
+                    inbox.acknowledge(id, now)?;
+                }
+                Some(InboxCommand::Snooze { id, minutes }) => {
+                    inbox.snooze(id, now + (*minutes as i64) * 60)?;
+                }
+                None => {
+                    refresh_with_inbox(&cli, &dir)?;
+                }
+            }
+            let items = open_inbox(&dir)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&items)?);
+            } else if items.is_empty() {
+                println!(
+                    "No open observed attention events. Claude hooks are required; unknown states are not inferred as requests."
+                );
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}  {}  {}",
+                        item.id,
+                        item.kind.label(),
+                        clean(item.title.as_deref().unwrap_or(&item.session_id)),
+                        if item.is_snoozed(now) {
+                            "snoozed"
+                        } else if item.read_at.is_some() {
+                            "read"
+                        } else {
+                            "new"
+                        }
+                    );
+                }
+            }
+        }
         Some(Commands::SessionServer { id, name, command }) => {
             managed::serve(&dir, id, name.as_deref(), command)?
         }
@@ -1656,6 +2105,7 @@ fn run() -> Result<()> {
                 "SessionStart",
                 "UserPromptSubmit",
                 "PreToolUse",
+                "PermissionRequest",
                 "PostToolUse",
                 "PostToolUseFailure",
                 "Notification",
@@ -1809,7 +2259,11 @@ fn run() -> Result<()> {
             let flag = running.clone();
             ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))?;
             while running.load(Ordering::SeqCst) {
-                let snapshots = all_snapshots(&cli, &dir)?;
+                let snapshots = if cli.notify {
+                    refresh_with_inbox(&cli, &dir)?.0
+                } else {
+                    all_snapshots(&cli, &dir)?
+                };
                 if cli.watch && !cli.json && io::stdout().is_terminal() {
                     print!("\x1b[2J\x1b[H");
                 }

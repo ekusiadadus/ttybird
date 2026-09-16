@@ -136,6 +136,10 @@ pub struct TokenUsage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInsights {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::WorkspaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<String>,
     pub title: Option<String>,
     pub usage: Option<TokenUsage>,
     /// Collection-only identity for explicit, revalidated local conversation reads.
