@@ -65,13 +65,43 @@ cargo install --path . --locked
 ttybird --local
 ```
 
+## 内蔵端末（tmux不要）
+
+```sh
+ttybird run --name backend -- codex
+ttybird run -- claude
+ttybird run --detach --name review -- codex
+ttybird sessions
+ttybird attach SESSION_ID
+ttybird stop SESSION_ID
+```
+
+左に一覧、右にTTYbird経由で起動した端末を表示します。Enterまたは`i`で
+**INPUTモード**に入り、キー・Ctrl-C・貼り付けをプログラムへ送ります。
+**Ctrl+]**で一覧に戻り、一覧側の`q`で画面だけ閉じます。プログラムは継続し、
+`attach`で再接続できます。終了させるときは`stop`を使います。
+
+セッションごとのバックグラウンドプロセスがPTYとlibghostty-vtの画面状態を
+メモリに保持します。ディスクには識別用メタデータだけを保存し、画面内容や
+コマンド引数は記録しません。ホスト再起動や保持プロセスの異常終了からの復元には
+対応しません。複数画面で開くと最後のリサイズが共有PTYに反映されます。
+マウス入力・端末内画像は未対応です。
+
+起動済みの通常のGhosttyタブを取り込む機能ではありません。右側で表示・入力
+したいセッションを`run`で新しく起動してください。
+
+独立した端末を持たない子のEnterは、記録された親の端末へ移動します。
+Ghosttyの初回紐付けは親に一度だけ行います。子自身の会話は`c`で確認できます。
+
 ## 主なキー
 
 | キー | 操作 |
 |---|---|
 | ↑ / ↓、j / k | セッションを選択 |
 | Space、← / → | 親子ツリーの折りたたみ・展開・移動 |
-| Enter | 対応端末へ移動、またはGhosttyペインを選択 |
+| Enter | 対応端末へ移動。独立した端末がない子は親の端末へ |
+| Enter / i（TTYbird経由の端末） | 右ペインのINPUTモードへ |
+| Ctrl+]（INPUTモード） | プログラムを止めず一覧へ戻る |
 | p | ローカルtmuxのプレビュー。PageUp/PageDownで表示範囲を移動 |
 | c | 直近のローカル会話を表示。Escで閉じる |
 | d / / | 技術的な詳細 / タイトルなどを検索 |

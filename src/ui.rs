@@ -51,6 +51,63 @@ pub struct App {
     pub conversation_text: Option<String>,
     pub collapsed: HashSet<(String, Provider, String)>,
     pub ghostty_picker: Option<GhosttyPicker>,
+    pub managed_id: Option<String>,
+    pub managed_parent: bool,
+    pub managed_text: Option<Text<'static>>,
+    pub managed_cursor: Option<(u16, u16)>,
+    pub managed_notice: Option<String>,
+    pub terminal_input: bool,
+}
+
+/// A subagent often has no independent terminal. Use the recorded ancestry,
+/// never a directory match, to navigate to its nearest available parent.
+pub fn navigation_session<'a>(
+    session: &'a Session,
+    snapshots: &'a [Snapshot],
+) -> Option<&'a Session> {
+    let mut current = session;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.id.as_str()) {
+            return None;
+        }
+        if current.target.is_some() || current.parent_id.is_none() {
+            return Some(current);
+        }
+        let parent = current.parent_id.as_deref()?;
+        current = snapshots
+            .iter()
+            .flat_map(|s| &s.sessions)
+            .find(|candidate| {
+                candidate.id == parent
+                    && candidate.host == session.host
+                    && candidate.provider == session.provider
+            })?;
+    }
+}
+
+fn enter_hint(session: &Session, snapshots: &[Snapshot]) -> String {
+    match navigation_session(session, snapshots) {
+        Some(target)
+            if target.id != session.id && matches!(target.target, Some(Target::Managed { .. })) =>
+        {
+            "Enter: operate PARENT terminal · c: read this child's conversation".into()
+        }
+        Some(target) if matches!(target.target, Some(Target::Managed { .. })) => {
+            "Enter: operate owned terminal · Ctrl+]: return to list".into()
+        }
+        Some(target) if target.id != session.id && target.target.is_some() => {
+            "Enter: open parent terminal · c: read this child's conversation".into()
+        }
+        Some(target) if target.id != session.id => {
+            "Enter: link the parent's terminal once · child has no separate pane".into()
+        }
+        Some(target) if target.target.is_none() => {
+            "Enter: link this session to its terminal (one-time setup)".into()
+        }
+        Some(_) => "Enter: open this session's terminal".into(),
+        None => "No parent terminal found · c: read this child's conversation".into(),
+    }
 }
 
 struct TreeRow<'a> {
@@ -547,6 +604,8 @@ fn role_label(session: &Session, child_count: usize) -> &'static str {
         "Subagent"
     } else if child_count > 0 {
         "Parent"
+    } else if matches!(session.target, Some(Target::Managed { .. })) {
+        "Terminal"
     } else if is_raw_process(session) {
         "Process"
     } else if session.pid.is_none() {
@@ -745,6 +804,7 @@ fn state_style(session: &Session) -> Style {
 
 fn terminal_label(session: &Session) -> String {
     match session.target.as_ref() {
+        Some(Target::Managed { .. }) => "TTYbird".to_owned(),
         Some(Target::Ghostty { .. }) => "Ghostty binding".to_owned(),
         Some(Target::Tmux { pane, .. }) => format!("tmux {}", sanitize(pane, 16)),
         None => session
@@ -1008,7 +1068,9 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             filters.push("retained/background visible");
         }
         let text = if filters.is_empty() {
-            if area.width < 72 {
+            if let Some(session) = app.selected_session() {
+                enter_hint(session, &app.snapshots)
+            } else if area.width < 72 {
                 "Space fold · ←/→ tree · Enter focus terminal".to_owned()
             } else {
                 "Space folds a branch · ←/→ navigate tree · Enter focuses the mapped terminal"
@@ -1180,12 +1242,16 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
         })
         .unwrap_or_else(|| "No live PID".to_owned());
     let navigation = match session.target.as_ref() {
+        Some(Target::Managed { .. }) => {
+            "Enter or i operates the right pane; Ctrl+] returns to the list".to_owned()
+        }
         Some(Target::Ghostty { .. }) => {
             "Saved Ghostty binding; pane existence is checked on Enter".to_owned()
         }
         Some(Target::Tmux { pane, .. }) => {
             format!("Enter opens verified tmux pane {}", sanitize(pane, 16))
         }
+        None if session.parent_id.is_some() => enter_hint(session, snapshots),
         None => "No bound terminal · Enter to choose a Ghostty pane on local macOS".to_owned(),
     };
     let parent = session.parent_id.as_deref().and_then(|parent_id| {
@@ -1353,13 +1419,12 @@ fn render_details(
             Line::from("c  Recent conversation (local, opt-in)"),
             Line::from("p  Read-only terminal preview"),
             Line::from("d  Process identity and evidence"),
-            Line::from("Enter  Return to the mapped terminal"),
+            Line::from(enter_hint(session, snapshots)),
         ]);
         lines
     } else {
         vec![Line::from("Select a session.")]
     };
-    let _ = snapshots;
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(border_block("Session"))
@@ -1429,8 +1494,62 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(preview, area);
 }
 
+fn render_managed(frame: &mut Frame, area: Rect, app: &App) {
+    let name = if app.managed_parent {
+        "Parent terminal"
+    } else {
+        "Terminal"
+    };
+    let mode = if app.terminal_input {
+        format!("{name} · INPUT · Ctrl+] returns to list")
+    } else {
+        format!("{name} · VIEW · Enter or i to type")
+    };
+    let block = border_block(&mode);
+    let inner = block.inner(area);
+    let content = app.managed_text.clone().unwrap_or_else(|| {
+        Text::from(
+            app.managed_notice
+                .clone()
+                .unwrap_or_else(|| "Connecting to owned terminal…".into()),
+        )
+    });
+    frame.render_widget(Paragraph::new(content).block(block), area);
+    if app.terminal_input
+        && let Some((x, y)) = app.managed_cursor
+        && x < inner.width
+        && y < inner.height
+    {
+        frame.set_cursor_position((inner.x + x, inner.y + y));
+    }
+}
+
+/// Matches the terminal panel layout below, excluding borders.
+pub fn managed_size(area: Rect) -> (u16, u16) {
+    let body_height = area.height.saturating_sub(5);
+    let (width, height) = if area.width >= 105 {
+        let pane = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(Rect::new(0, 0, area.width, body_height))[1];
+        (pane.width, pane.height)
+    } else {
+        let pane = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(Rect::new(0, 0, area.width, body_height))[1];
+        (pane.width, pane.height)
+    };
+    (
+        width.saturating_sub(2).clamp(2, 200),
+        height.saturating_sub(2).clamp(2, 80),
+    )
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if app.show_preview {
+    let text = if app.managed_id.is_some() {
+        if app.terminal_input {
+            "INPUT → owned terminal · Ctrl+] returns to list · Ctrl-C goes to the program"
+        } else {
+            "↑↓/jk choose · Enter/i type in terminal · q detach (program keeps running) · ? help"
+        }
+    } else if app.show_preview {
         if area.width < 72 {
             "Pg scroll · p close · ←/→ tree · Space fold"
         } else {
@@ -1479,7 +1598,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("← →          Collapse/parent · expand/first child"),
         Line::from("Space        Toggle the selected branch"),
         Line::from("h            Show/hide log-only history (not live sessions)"),
-        Line::from("Enter        Verify and focus the selected terminal target"),
+        Line::from("Enter        Open its terminal; children without one use their parent"),
+        Line::from("Enter / i    Owned terminal: enter INPUT mode in the right pane"),
+        Line::from("Ctrl+]       Leave INPUT mode; q in the list detaches"),
         Line::from("p            Read-only terminal preview; PageUp/PageDown scroll"),
         Line::from("d            Full details; arrows/PageUp/PageDown scroll"),
         Line::from("/            Search sessions"),
@@ -1639,7 +1760,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if layout[2].height < 6 {
         render_sessions(frame, layout[2], app, &rows, multiple_hosts);
     } else if area.width >= 105 {
-        let constraints = if app.show_preview {
+        let constraints = if app.managed_id.is_some() {
+            [Constraint::Percentage(30), Constraint::Percentage(70)]
+        } else if app.show_preview {
             [Constraint::Percentage(40), Constraint::Percentage(60)]
         } else {
             [Constraint::Percentage(60), Constraint::Percentage(40)]
@@ -1649,7 +1772,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .constraints(constraints)
             .split(layout[2]);
         render_sessions(frame, body[0], app, &rows, multiple_hosts);
-        if app.show_conversation {
+        if app.managed_id.is_some() && !app.show_conversation {
+            render_managed(frame, body[1], app);
+        } else if app.show_conversation {
             render_conversation(frame, body[1], app);
         } else if app.show_preview {
             render_preview(frame, body[1], app);
@@ -1662,7 +1787,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
         }
     } else {
-        let constraints = if app.show_preview {
+        let constraints = if app.managed_id.is_some() {
+            [Constraint::Percentage(30), Constraint::Percentage(70)]
+        } else if app.show_preview {
             [Constraint::Percentage(40), Constraint::Percentage(60)]
         } else {
             [Constraint::Percentage(60), Constraint::Percentage(40)]
@@ -1672,7 +1799,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .constraints(constraints)
             .split(layout[2]);
         render_sessions(frame, body[0], app, &rows, multiple_hosts);
-        if app.show_conversation {
+        if app.managed_id.is_some() && !app.show_conversation {
+            render_managed(frame, body[1], app);
+        } else if app.show_conversation {
             render_conversation(frame, body[1], app);
         } else if app.show_preview {
             render_preview(frame, body[1], app);
@@ -1749,6 +1878,51 @@ mod tests {
             sessions,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn enter_routes_children_to_recorded_parent_not_same_directory() {
+        let parent = session("parent", "same", Activity::Working);
+        let mut child = session("child", "same", Activity::Working);
+        child.parent_id = Some("parent".into());
+        child.target = None;
+        let snapshots = vec![snapshot(vec![parent, child.clone()])];
+        assert_eq!(navigation_session(&child, &snapshots).unwrap().id, "parent");
+        assert!(enter_hint(&child, &snapshots).contains("parent terminal"));
+        let mut managed_parent = snapshots[0].sessions[0].clone();
+        managed_parent.target = Some(Target::Managed {
+            session_id: "1234abcd".into(),
+        });
+        assert!(enter_hint(&child, &[snapshot(vec![managed_parent])]).contains("PARENT terminal"));
+        child.parent_id = Some("absent".into());
+        assert!(navigation_session(&child, &snapshots).is_none());
+        child.parent_id = Some("child".into());
+        let cycles = vec![snapshot(vec![child.clone()])];
+        assert!(navigation_session(&child, &cycles).is_none());
+        child.target = Some(Target::Managed {
+            session_id: "1234abcd".into(),
+        });
+        assert_eq!(navigation_session(&child, &snapshots).unwrap().id, "child");
+    }
+
+    #[test]
+    fn owned_terminal_view_and_input_are_distinct_and_keep_the_list() {
+        let mut s = session("managed-example", "example", Activity::Unknown);
+        s.target = Some(Target::Managed {
+            session_id: "1234abcd".into(),
+        });
+        let mut app = App {
+            managed_id: Some("1234abcd".into()),
+            managed_text: Some(Text::from("SYNTHETIC TERMINAL")),
+            ..Default::default()
+        };
+        app.set_snapshots(vec![snapshot(vec![s])]);
+        let text = rendered(&mut app, 160, 30);
+        assert!(text.contains("Sessions") && text.contains("SYNTHETIC TERMINAL"));
+        assert!(text.contains("Terminal · VIEW"));
+        app.terminal_input = true;
+        let text = rendered(&mut app, 160, 30);
+        assert!(text.contains("Terminal · INPUT") && text.contains("Ctrl+]"));
     }
 
     fn rendered(app: &mut App, width: u16, height: u16) -> String {

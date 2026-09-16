@@ -1,5 +1,8 @@
 pub mod collect;
 pub mod config;
+pub mod managed;
+pub mod managed_view;
+pub mod managed_vt;
 pub mod model;
 pub mod navigation;
 pub mod preview;

@@ -118,6 +118,7 @@ pub(crate) fn socket_args(socket: Option<&str>) -> Result<Vec<String>> {
 
 pub fn validate_target(target: &Target) -> Result<()> {
     match target {
+        Target::Managed { session_id } => crate::managed::validate_id(session_id),
         Target::Ghostty { terminal_id } => validate_ghostty_id(terminal_id),
         Target::Tmux { socket, pane } => {
             socket_args(socket.as_deref())?;
@@ -310,7 +311,7 @@ fn resolve_tmux_target(socket: Option<&str>, pane: &str) -> Result<ResolvedTmuxT
 pub fn target_tty(target: &Target) -> Result<Option<String>> {
     validate_target(target)?;
     match target {
-        Target::Ghostty { .. } => Ok(None),
+        Target::Ghostty { .. } | Target::Managed { .. } => Ok(None),
         Target::Tmux { socket, pane } => {
             Ok(Some(resolve_tmux_target(socket.as_deref(), pane)?.tty))
         }
@@ -342,6 +343,9 @@ pub fn focus(target: &Target) -> Result<()> {
     validate_target(target)?;
     match target {
         Target::Ghostty { terminal_id } => focus_ghostty(terminal_id),
+        Target::Managed { session_id } => {
+            bail!("use ttybird attach {session_id} for an owned terminal")
+        }
         Target::Tmux { socket, pane } => focus_tmux(socket.as_deref(), pane),
     }
 }

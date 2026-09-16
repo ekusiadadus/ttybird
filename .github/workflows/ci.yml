@@ -43,6 +43,7 @@ jobs:
         run: |
           python3 scripts/tui_smoke.py target/release/ttybird
           python3 scripts/liveness_smoke.py target/release/ttybird
+          python3 scripts/managed_smoke.py target/release/ttybird
           LC_ALL=C python3 scripts/tmux_preview_smoke.py target/release/ttybird --gemini
       - name: Ghostty chooser protocol (stub, no GUI focus)
         if: runner.os == 'macOS'

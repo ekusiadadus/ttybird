@@ -15,6 +15,7 @@ cargo test --release --locked -- --test-threads=2
 cargo build --release --locked --bin ttybird
 LC_ALL=C cargo test --release --locked --test tmux_preview -- --ignored
 python3 scripts/liveness_smoke.py target/release/ttybird
+python3 scripts/managed_smoke.py target/release/ttybird
 python3 scripts/tui_smoke.py target/release/ttybird
 LC_ALL=C python3 scripts/tmux_preview_smoke.py target/release/ttybird --gemini
 # macOS only; uses an osascript stub, never focuses a real pane:
@@ -36,6 +37,7 @@ explicitly; CI runs it in addition to the ordinary suite.
 | VT conversion | Pinned native libghostty-vt parses captures; owned text/styles are rendered by Ratatui | Full Ghostty GUI renderer equivalence, arbitrary PTY streams or graphics |
 | tmux preview | Real private pane; colors/Unicode/CR/erase, alternate screen, wrong identity, unchanged pane/buffers | Arbitrary tmux versions and remote capture |
 | Dashboard | Real PTY, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings, preview close/reopen | Exhaustive terminal emulators/keymaps |
+| Owned terminals | Real PTY + libghostty screen, explicit input/paste and Ctrl-C, Ctrl+] returning to the list, detach/reconnect, resize, private IPC, no screen persistence, stop cleanup | Every coding CLI, nested job-control programs, mouse/graphics, recovery after daemon/host failure |
 | Ghostty chooser | Real TUI with synthetic discovery, cancellation/stale rejection, exact-ID focus invocation, failed-focus binding rollback, dashboard retained after picker/saved focus, q restoration | A GUI end-to-end focus test on every Ghostty version |
 | SSH collector | Fixed command, versioned protocol, invalid destination rejection, bounded child execution | Authenticated multi-host network test |
 | Release portability | CI-native build and library reference check, version execution before packaging | Notarization, signing, all macOS/Linux versions |

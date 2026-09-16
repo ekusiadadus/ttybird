@@ -20,6 +20,12 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub fn parse(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<Text<'static>> {
     validate_limits(bytes, cols, rows)?;
     let input = normalize_tmux_line_endings(bytes);
+    parse_vt(&input, cols, rows)
+}
+
+/// Render a complete VT screen export, without tmux's LF normalization.
+pub fn parse_vt(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<Text<'static>> {
+    validate_limits(bytes, cols, rows)?;
 
     // libghostty-vt handles are !Send and !Sync. Keep their entire lifetime in
     // this call and return only owned Ratatui strings and styles.
@@ -35,7 +41,7 @@ pub fn parse(bytes: &[u8], cols: u16, rows: u16) -> anyhow::Result<Text<'static>
         .context("bound preview APC buffer")?
         .set_glyph_protocol_enabled(false)
         .context("disable preview glyph protocol")?;
-    terminal.vt_write(&input);
+    terminal.vt_write(bytes);
 
     let mut render_state = RenderState::new().context("create preview render state")?;
     let mut row_iterator = RowIterator::new().context("create preview row iterator")?;

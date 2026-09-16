@@ -2,7 +2,29 @@
 
 ## Decision: observe existing sessions
 
-TTYbird is a collector and navigation CLI. It does not own the agents' lifecycle. Rust provides one native executable for macOS/Linux, typed snapshots, bounded subprocess handling, and an SSH collector without a resident server or message broker.
+TTYbird observes existing agents without owning their lifecycle. Rust provides one native executable for macOS/Linux, typed snapshots, bounded subprocess handling, and an SSH collector without a resident server or message broker. The separate, explicit `run` command opts into lifecycle ownership for a newly launched terminal.
+
+## Optional owned terminals
+
+`run` starts one detached helper and a new controlling PTY, then opens the
+dashboard. The helper consumes PTY bytes into a persistent bounded libghostty-vt
+engine, answers terminal queries, and waits on descriptors when idle. A private
+Unix socket serializes screen, resize, key/paste and stop requests. Only process
+identity metadata is written to disk. Screen snapshots stay in memory and never
+enter ordinary collection JSON. Closing a dashboard drops its client; the helper
+continues until the program exits or an explicit `stop` terminates its owned group.
+
+The right pane shows the native VT engine's visible viewport. The TUI parses its
+bounded ANSI snapshot into owned Ratatui cells, rather than writing untrusted raw
+escape sequences to the host terminal. Input is available only after Enter/i on
+a verified local `Managed` target. Ctrl+] returns to navigation, and focus loss
+also disables input. Ordinary discovered Ghostty/tmux/remote sessions never gain
+an input path. A child without its own terminal routes to its recorded parent;
+the UI labels the parent destination before entering input mode.
+
+This is local, text-only terminal support. It does not import a foreign PTY,
+persist screen history across helper failures, support mouse/graphics, or provide
+exclusive control among multiple human viewers; viewers share PTY geometry.
 
 ```mermaid
 flowchart LR

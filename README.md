@@ -76,13 +76,42 @@ ttybird --local
 The first source build downloads pinned Ghostty source and Zig dependencies.
 The Rust binding is pinned to `libghostty-vt = 0.2.1`; Zig 0.16 is incompatible.
 
+## Owned terminals (no tmux required)
+
+Launch a new session explicitly to use a live, interactive right pane:
+
+```sh
+ttybird run --name backend -- codex
+# Or: ttybird run -- claude
+# Launch without opening the dashboard:
+ttybird run --detach --name review -- codex
+ttybird sessions
+ttybird attach SESSION_ID
+ttybird stop SESSION_ID
+```
+
+The agent list stays on the left. **Enter or i** puts the selected owned terminal
+in **INPUT** mode; keys, Ctrl-C and pasted text go to that program. **Ctrl+]**
+returns to the list. **q in the list** detaches without stopping the program.
+Use `stop` to end an owned session. This does not import already-running Ghostty
+tabs: launch through `run` when you want embedded display and input.
+
+One local helper per owned session retains the PTY and bounded libghostty-vt
+screen in memory while dashboards are closed. A private Unix socket carries
+screen snapshots and explicit input. Only identity metadata is saved to disk;
+screen contents and command arguments are not logged. Host reboot/helper failure
+does not preserve a session. Multiple viewers share one PTY size; the most recent
+viewer resize applies. Embedded mouse input and terminal graphics are not supported.
+
 ## Controls
 
 | Key | Action |
 |---|---|
 | ↑ / ↓ or j / k | Select a session |
 | Space / ← / → | Fold, expand, or navigate the parent/child tree |
-| Enter | Return to its mapped terminal, or choose a Ghostty pane |
+| Enter | Open its terminal; a child without one uses its recorded parent |
+| Enter / i on an owned terminal | Enter INPUT mode in the right pane |
+| Ctrl+] in INPUT mode | Return to the list without stopping the program |
 | p | Toggle local tmux preview; PageUp/PageDown scroll the captured screen |
 | c | Recent local Codex/Claude messages, only when requested; Esc closes |
 | d | Full metadata and evidence |
@@ -91,6 +120,10 @@ The Rust binding is pinned to `libghostty-vt = 0.2.1`; Zig 0.16 is incompatible.
 | b / h | Show retained children, auxiliary and background processes / recent log-only history |
 | r / ? | Refresh / keyboard help |
 | q / Ctrl-C | Exit and restore the terminal |
+
+For a child without its own terminal, Enter opens its **recorded parent's**
+terminal. Only the parent needs the initial Ghostty mapping. `c` still opens the
+selected child's conversation; the status line states the Enter destination.
 
 Piped output is plain text by default. Use `--plain`, `--json`, or
 `--watch --json` (JSONL) explicitly for scripts. `ttybird doctor` checks runtime
