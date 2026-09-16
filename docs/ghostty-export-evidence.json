@@ -1,0 +1,95 @@
+{
+  "verified_at": "2026-09-16T06:46:41.180577+00:00",
+  "environment": {
+    "os": "macOS",
+    "ghostty_version": "1.3.1",
+    "ghostty_build": "15212",
+    "ttybird_version": "0.10.2 local development build"
+  },
+  "scope": "Synthetic Ghostty tabs only; no model sessions captured",
+  "checkpoints": [
+    {
+      "at": "2026-09-16T06:35:20.693227+00:00",
+      "checkpoint": "E01-selected-tab",
+      "passed": true,
+      "temporary_exports_cleaned": true,
+      "selected_tab_unchanged": true,
+      "elapsed_ms": 771,
+      "test_exit": 0
+    },
+    {
+      "at": "2026-09-16T06:35:21.438559+00:00",
+      "checkpoint": "E02-hidden-tab-new-output",
+      "passed": true,
+      "temporary_exports_cleaned": true,
+      "selected_tab_unchanged": true,
+      "elapsed_ms": 289,
+      "test_exit": 0
+    },
+    {
+      "at": "2026-09-16T06:35:22.148899+00:00",
+      "checkpoint": "E03-original-after-split",
+      "passed": true,
+      "temporary_exports_cleaned": true,
+      "selected_tab_unchanged": true,
+      "elapsed_ms": 325,
+      "test_exit": 0
+    },
+    {
+      "at": "2026-09-16T06:35:22.547596+00:00",
+      "checkpoint": "E04-exact-split",
+      "passed": true,
+      "temporary_exports_cleaned": true,
+      "selected_tab_unchanged": true,
+      "elapsed_ms": 297,
+      "test_exit": 0
+    },
+    {
+      "at": "2026-09-16T06:35:23.002541+00:00",
+      "checkpoint": "E05-closed-uuid",
+      "passed": true,
+      "temporary_exports_cleaned": true,
+      "selected_tab_unchanged": true,
+      "elapsed_ms": 286,
+      "test_exit": 0
+    },
+    {
+      "at": "2026-09-16T06:35:23.991230+00:00",
+      "checkpoint": "E06-cleanup",
+      "passed": true,
+      "fixture_processes_remaining": 0
+    },
+    {
+      "at": "2026-09-16T06:35:24Z",
+      "checkpoint": "E07-clipboard",
+      "clipboard_multitype_preserved": true,
+      "original_clipboard_readback_matched": true,
+      "passed": true
+    }
+  ],
+  "source_sha256": {
+    "src/ghostty_export.rs": "8309bad3d6d08b07301a181386a7e1aeb17f7a12b1cac3d0957bece9d1c74c66",
+    "scripts/ghostty_export.js": "2adefaf88559440568eb9582d0da103f0bcd986bd03c5b7d69c26b923887f561",
+    "src/terminal_preview.rs": "e243667995eada15dcd99e762506d1c8bdc989a5f7a5d27e221f44550da7ef9e",
+    "tests/ghostty_export.rs": "6533cc05d55c1d703a4beeab7a7db3c0960c4fa8cc1182cc67da3e3483cf0edb",
+    "scripts/ghostty_export_smoke.py": "f15b74f16f3b1387c2c9a839162d7e0c249cd54677a3ccee7b2a505fea65b2d2",
+    "scripts/ghostty_export_clipboard_guard.swift": "7bdc432fc41c987362b281e08df5f65c306c67a8f700dd4ad203398be09073a4",
+    "src/main.rs": "5cd4420a34343590222a6966e6ae44670656d4105258bbe25d40654ea4c33425",
+    "src/ui.rs": "25262f49862e9942afb4b2cc3f028572b621b801e7db7188ffb877be5314b8e8",
+    "scripts/ghostty_picker_smoke.py": "1108b1df0f6bb0f1f2ee2011441ae129833fba64d8f344c70280370441f1f611"
+  },
+  "validation": {
+    "rust_tests_passed": 152,
+    "fmt": true,
+    "clippy_all_targets": true,
+    "tmux_native_integration": true,
+    "readonly_collection_json": true,
+    "synthetic_tui_selection_opens_without_p": true
+  },
+  "limits": [
+    "On-selection output snapshot includes scrollback; 120-column reflow and latest 200 rendered rows",
+    "Not an exact viewport, cursor or scroll-position mirror",
+    "Clipboard restore is not atomic; crashes/timeouts can leave export path and private temporary file",
+    "Selected-tab identity checked; internal split focus and other Ghostty versions not independently verified"
+  ]
+}

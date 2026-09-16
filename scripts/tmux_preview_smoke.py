@@ -131,12 +131,11 @@ sys.exit(code)
                 visible = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', bytes(output))
                 raise AssertionError('expected synthetic UI state was not rendered: ' + visible[-1400:].decode('utf-8', 'replace'))
         wait_for(b'TTYbird')
-        # Filter before requesting any preview: never capture a real user's pane.
+        # Restrict to the synthetic target; only this private tmux server is discoverable.
         os.write(master, ('/' + os.path.basename(root)).encode())
         drain(.3)
         os.write(master, b'\r')
         drain(2)
-        os.write(master, b'p')
         wait_for(b'SYNTHETIC_PREVIEW_OK')
         output.clear()
         os.write(master, b'p')

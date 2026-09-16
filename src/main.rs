@@ -82,9 +82,13 @@ enum Commands {
     },
     /// List owned terminals (metadata only).
     Sessions,
-    /// Stop only the selected TTYbird-owned terminal and its process group.
+    /// Stop TTYbird-owned terminals and their process groups (never discovered agents).
     Stop {
-        session: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        session: Option<String>,
+        /// Stop every running terminal launched through ttybird in this config directory.
+        #[arg(long)]
+        all: bool,
     },
     #[command(name = "__session-server", hide = true)]
     SessionServer {
@@ -197,8 +201,14 @@ fn options(cli: &Cli) -> CollectOptions {
 }
 
 fn local_snapshot(cli: &Cli, dir: &std::path::Path) -> Result<Snapshot> {
+    local_snapshot_mode(cli, dir, true)
+}
+
+fn local_snapshot_mode(cli: &Cli, dir: &std::path::Path, runtime_query: bool) -> Result<Snapshot> {
     let mut snapshot = collect::collect(&options(cli))?;
-    ttybird::codex_status::enrich(&mut snapshot);
+    if runtime_query {
+        ttybird::codex_status::enrich(&mut snapshot);
+    }
     if let Err(e) = telemetry::enrich(dir, &mut snapshot) {
         snapshot
             .warnings
@@ -415,7 +425,7 @@ fn provider_capabilities() -> Vec<serde_json::Value> {
             "session_log_metadata": logs,
             "activity": if logs { "provider evidence when available" } else { "unknown; process observation only" },
             "terminal_navigation": "requires verified mapping",
-            "terminal_preview": "verified local tmux pane only"
+            "terminal_preview": "local tmux screen; macOS Ghostty on-selection UUID output snapshot"
         })
     }).collect()
 }
@@ -438,7 +448,15 @@ fn proof(s: &Confidence) -> &str {
 }
 
 fn all_snapshots(cli: &Cli, dir: &std::path::Path) -> Result<Vec<Snapshot>> {
-    let local = local_snapshot(cli, dir)?;
+    all_snapshots_mode(cli, dir, true)
+}
+
+fn all_snapshots_mode(
+    cli: &Cli,
+    dir: &std::path::Path,
+    runtime_query: bool,
+) -> Result<Vec<Snapshot>> {
+    let local = local_snapshot_mode(cli, dir, runtime_query)?;
     let hosts = if cli.local {
         vec![]
     } else {
@@ -849,9 +867,14 @@ fn open_inbox(dir: &std::path::Path) -> Result<AttentionItems> {
 }
 fn refresh_with_inbox(cli: &Cli, dir: &std::path::Path) -> Result<(Vec<Snapshot>, AttentionItems)> {
     let mut snapshots = all_snapshots(cli, dir)?;
+    let items = update_inbox(cli, dir, &mut snapshots);
+    Ok((snapshots, items))
+}
+
+fn update_inbox(cli: &Cli, dir: &std::path::Path, snapshots: &mut [Snapshot]) -> AttentionItems {
     let inbox = ttybird::attention::AttentionInbox::new(dir);
     let now = chrono::Utc::now().timestamp();
-    let result = inbox.update(&snapshots, now).and_then(|update| {
+    let result = inbox.update(snapshots, now).and_then(|update| {
         if cli.notify {
             let report = inbox.notify_pending(now)?;
             if report.failed > 0 && let Some(local) = snapshots.first_mut() {
@@ -864,7 +887,7 @@ fn refresh_with_inbox(cli: &Cli, dir: &std::path::Path) -> Result<(Vec<Snapshot>
             .filter(|item| item.is_open())
             .collect())
     });
-    let items = match result {
+    match result {
         Ok(items) => items,
         Err(error) => {
             if let Some(local) = snapshots.first_mut() {
@@ -874,8 +897,7 @@ fn refresh_with_inbox(cli: &Cli, dir: &std::path::Path) -> Result<(Vec<Snapshot>
             }
             Vec::new()
         }
-    };
-    Ok((snapshots, items))
+    }
 }
 
 fn interactive(
@@ -892,6 +914,17 @@ fn interactive(
     let running = Arc::new(AtomicBool::new(true));
     let signal = running.clone();
     ctrlc::set_handler(move || signal.store(false, Ordering::SeqCst))?;
+    // Declare before the screen guard and channels: every exit restores the
+    // terminal and disconnects channels before bounded capture cleanup joins.
+    struct CaptureWorker(Option<std::thread::JoinHandle<()>>);
+    impl Drop for CaptureWorker {
+        fn drop(&mut self) {
+            if let Some(worker) = self.0.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    let mut preview_worker = CaptureWorker(None);
     let guard = ScreenGuard::enter()?;
     let backend = ratatui::backend::CrosstermBackend::new(HangupSafeWriter::new(io::stdout()));
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -904,22 +937,43 @@ fn interactive(
     let mut initial_managed = initial_managed.map(str::to_owned);
     let owned_client = ttybird::managed_view::Client::new(dir);
     let mut owned_generation = 0u64;
-    let mut owned_frame_busy = false;
-    let mut owned_next_frame = Instant::now();
+    let mut owned_watch: Option<(String, u16, u16)> = None;
     let (requests, work) = mpsc::sync_channel::<()>(1);
-    let (results, ready) =
-        mpsc::sync_channel::<std::result::Result<(Vec<Snapshot>, AttentionItems), String>>(1);
+    let (results, ready) = mpsc::sync_channel::<std::result::Result<Vec<Snapshot>, String>>(1);
     let worker_cli = cli.clone();
     let worker_dir = dir.to_path_buf();
     // One collector at a time. The UI never waits on SSH or process inspection.
     std::thread::spawn(move || {
         while work.recv().is_ok() {
-            let result = refresh_with_inbox(&worker_cli, &worker_dir).map_err(|e| format!("{e:#}"));
+            let result =
+                all_snapshots_mode(&worker_cli, &worker_dir, false).map_err(|e| format!("{e:#}"));
             if results.send(result).is_err() {
                 break;
             }
         }
     });
+    let status_watcher = ttybird::codex_status::Watcher::spawn();
+    // Keep log/process evidence separate so a disconnected observer cannot leave
+    // a formerly observed runtime state on screen.
+    let mut raw_snapshots: Option<Vec<Snapshot>> = None;
+    let (inbox_requests, inbox_work) = mpsc::sync_channel::<(u64, Vec<Snapshot>)>(1);
+    let (inbox_results, inbox_ready) = mpsc::sync_channel(1);
+    let inbox_cli = cli.clone();
+    let inbox_dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        while let Ok((revision, mut snapshots)) = inbox_work.recv() {
+            let items = update_inbox(&inbox_cli, &inbox_dir, &mut snapshots);
+            let warnings = snapshots
+                .first()
+                .map(|s| s.warnings.clone())
+                .unwrap_or_default();
+            if inbox_results.send((revision, items, warnings)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut inbox_revision = 0u64;
+    let mut inbox_pending = false;
     requests.try_send(()).ok();
     app.refreshing = true;
     let mut last_request = Instant::now();
@@ -928,7 +982,7 @@ fn interactive(
     // screen cells cross this channel; the !Send VT parser stays on its worker.
     let (preview_requests, preview_work) = mpsc::sync_channel::<(u64, String, Session, String)>(1);
     let (preview_results, preview_ready) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    preview_worker.0 = Some(std::thread::spawn(move || {
         while let Ok((generation, key, session, local_host)) = preview_work.recv() {
             let result = ttybird::terminal_preview::capture(&session, &local_host)
                 .map_err(|e| format!("{e:#}"));
@@ -936,14 +990,17 @@ fn interactive(
                 break;
             }
         }
-    });
+    }));
     let mut preview_key = None;
+    let mut auto_preview_selection = None;
     let mut preview_generation = 0u64;
     let mut preview_local = false;
     let mut preview_busy = false;
     let mut next_preview = Instant::now();
     let mut destination = None;
     let mut focus_query: Option<mpsc::Receiver<FocusResult>> = None;
+    type StopResult = std::result::Result<(), String>;
+    let mut stop_query: Option<(String, mpsc::Receiver<StopResult>)> = None;
     type PaneQuery = (
         Session,
         std::result::Result<Vec<navigation::GhosttyTerminal>, String>,
@@ -1010,6 +1067,46 @@ fn interactive(
                 Err(error) => app.notice = Some(format!("Handoff: {}", clean(&error))),
             }
         }
+        if let Some((id, result)) = stop_query
+            .as_ref()
+            .and_then(|(id, rx)| rx.try_recv().ok().map(|result| (id.clone(), result)))
+        {
+            stop_query = None;
+            redraw = true;
+            match result {
+                Ok(()) => {
+                    // Remove only this owned target, never another session sharing
+                    // its directory or provider backend. Reject pre-stop collection.
+                    let remove_target = |snapshots: &mut Vec<Snapshot>| {
+                        for snapshot in snapshots {
+                            snapshot.sessions.retain(|session| !matches!(
+                                &session.target, Some(Target::Managed { session_id }) if session_id == &id
+                            ));
+                        }
+                    };
+                    let mut snapshots = app.snapshots.clone();
+                    remove_target(&mut snapshots);
+                    app.set_snapshots(snapshots);
+                    if let Some(raw) = &mut raw_snapshots {
+                        remove_target(raw);
+                        if let Some(local) = raw.first() {
+                            status_watcher.update_targets(local);
+                        }
+                    }
+                    inbox_revision = inbox_revision.wrapping_add(1);
+                    inbox_pending = true;
+                    discard_refresh = app.refreshing;
+                    if !app.refreshing && requests.try_send(()).is_ok() {
+                        app.refreshing = true;
+                        last_request = Instant::now();
+                    }
+                    app.notice = Some("Stopped owned terminal. TTYbird stays open.".into());
+                }
+                Err(error) => {
+                    app.notice = Some(format!("Cannot stop owned terminal: {}", clean(&error)))
+                }
+            }
+        }
         if let Some(result) = focus_query.as_ref().and_then(|rx| rx.try_recv().ok()) {
             focus_query = None;
             redraw = true;
@@ -1023,14 +1120,23 @@ fn interactive(
             app.notice = Some(match result {
                 Ok(binding) => {
                     if let Some(binding) = binding {
-                        for session in app.snapshots.iter_mut().flat_map(|s| &mut s.sessions) {
-                            if session.host == binding.host
-                                && session.id == binding.session_id
-                                && session.pid == Some(binding.pid)
-                                && session.process_started_at == Some(binding.process_started_at)
-                            {
-                                session.target = Some(binding.target.clone());
+                        let apply_target = |snapshots: &mut Vec<Snapshot>| {
+                            for session in snapshots.iter_mut().flat_map(|s| &mut s.sessions) {
+                                if session.host == binding.host
+                                    && session.id == binding.session_id
+                                    && session.pid == Some(binding.pid)
+                                    && session.process_started_at
+                                        == Some(binding.process_started_at)
+                                {
+                                    session.target = Some(binding.target.clone());
+                                }
                             }
+                        };
+                        let mut snapshots = app.snapshots.clone();
+                        apply_target(&mut snapshots);
+                        app.set_snapshots(snapshots);
+                        if let Some(raw) = &mut raw_snapshots {
+                            apply_target(raw);
                         }
                     }
                     "Focused Ghostty. TTYbird stays open here; q quits.".into()
@@ -1095,15 +1201,27 @@ fn interactive(
                 continue;
             }
             match result {
-                Ok((snapshots, items)) => {
+                Ok(mut snapshots) => {
+                    if let Some(local) = snapshots.first() {
+                        status_watcher.update_targets(local);
+                    }
+                    raw_snapshots = Some(snapshots.clone());
+                    if let Some(local) = snapshots.first_mut() {
+                        status_watcher.apply(local);
+                    }
                     app.set_snapshots(snapshots);
-                    app.attention = items;
+                    inbox_revision = inbox_revision.wrapping_add(1);
+                    inbox_pending = true;
                 }
                 Err(error) => {
                     // Discard queries carrying a frozen pre-failure process
                     // identity and reject any in-flight preview response.
                     pane_query = None;
                     preview_generation = preview_generation.wrapping_add(1);
+                    raw_snapshots = None;
+                    status_watcher.update_targets(&Snapshot::new(String::new()));
+                    inbox_revision = inbox_revision.wrapping_add(1);
+                    inbox_pending = false;
                     app.invalidate_liveness();
                     app.notice = Some(format!(
                         "Refresh failed; live status unavailable: {}",
@@ -1111,6 +1229,34 @@ fn interactive(
                     ))
                 }
             }
+        }
+        if status_watcher.take_changed()
+            && let Some(raw) = &raw_snapshots
+        {
+            let mut snapshots = raw.clone();
+            if let Some(local) = snapshots.first_mut() {
+                status_watcher.apply(local);
+            }
+            app.set_snapshots(snapshots);
+            inbox_revision = inbox_revision.wrapping_add(1);
+            inbox_pending = true;
+            redraw = true;
+        }
+        while let Ok((revision, items, warnings)) = inbox_ready.try_recv() {
+            if revision == inbox_revision {
+                app.attention = items;
+                if let Some(local) = app.snapshots.first_mut() {
+                    local.warnings = warnings;
+                }
+                redraw = true;
+            }
+        }
+        if inbox_pending
+            && inbox_requests
+                .try_send((inbox_revision, app.snapshots.clone()))
+                .is_ok()
+        {
+            inbox_pending = false;
         }
         if let Some(id) = initial_managed.as_deref() {
             let session = app.snapshots.iter().flat_map(|s| &s.sessions).find(|s| {
@@ -1145,13 +1291,52 @@ fn interactive(
             app.managed_notice = None;
             app.terminal_input = false;
             owned_generation = owned_generation.wrapping_add(1);
-            owned_next_frame = Instant::now();
+            redraw = true;
+        }
+        // Only the visible owned terminal has a subscription. Selection,
+        // overlays and resize invalidate replies from the previous screen.
+        let desired_watch = if !app.show_conversation
+            && !app.show_details
+            && !app.show_help
+            && app.handoff.is_none()
+            && !app.show_inbox
+            && app.ghostty_picker.is_none()
+        {
+            if let Some(id) = app.managed_id.as_ref() {
+                let size = terminal.size()?;
+                let (cols, rows) = ttybird::ui::managed_size(ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    size.width,
+                    size.height,
+                ));
+                Some((id.clone(), cols, rows))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if desired_watch != owned_watch {
+            owned_generation = owned_generation.wrapping_add(1);
+            app.managed_text = None;
+            app.managed_cursor = None;
+            app.managed_notice = None;
+            let result = match &desired_watch {
+                Some((id, cols, rows)) => owned_client.watch(owned_generation, id, *cols, *rows),
+                None => owned_client.unwatch(),
+            };
+            if let Err(error) = result {
+                app.terminal_input = false;
+                app.managed_notice = Some(format!(
+                    "{}; press r to reconnect",
+                    clean(&error.to_string())
+                ));
+            }
+            owned_watch = desired_watch;
             redraw = true;
         }
         while let Ok(reply) = owned_client.replies.try_recv() {
-            if reply.frame {
-                owned_frame_busy = false;
-            }
             if reply.generation != owned_generation {
                 continue;
             }
@@ -1178,36 +1363,11 @@ fn interactive(
                     app.terminal_input = false;
                     app.managed_text = None;
                     app.managed_cursor = None;
-                    app.managed_notice = Some(clean(&error));
-                    owned_next_frame = Instant::now() + Duration::from_secs(2);
+                    app.managed_notice =
+                        Some(format!("{}; r reconnects the viewer", clean(&error)));
                     redraw = true;
                 }
             }
-        }
-        if !owned_frame_busy
-            && Instant::now() >= owned_next_frame
-            && !app.show_conversation
-            && !app.show_details
-            && !app.show_help
-            && app.handoff.is_none()
-            && !app.show_inbox
-            && let Some(id) = app.managed_id.as_deref()
-        {
-            let size = terminal.size()?;
-            let (cols, rows) = ttybird::ui::managed_size(ratatui::layout::Rect::new(
-                0,
-                0,
-                size.width,
-                size.height,
-            ));
-            if owned_client
-                .submit(owned_generation, id, managed::Request::Frame { cols, rows })
-                .is_ok()
-            {
-                owned_frame_busy = true;
-            }
-            owned_next_frame =
-                Instant::now() + Duration::from_millis(if app.terminal_input { 40 } else { 250 });
         }
         // Refresh may replace the selection: clear old text before this frame is drawn.
         let selected_key = app
@@ -1219,10 +1379,32 @@ fn interactive(
             conversation_query = None;
             redraw = true;
         }
+        // Selecting a readable terminal shows it directly. Stable metadata
+        // refreshes do not trigger a new Ghostty export. p can hide the view
+        // until the user chooses a different terminal.
+        if selected_key != auto_preview_selection {
+            auto_preview_selection = selected_key.clone();
+            if !app.show_details && !app.show_conversation {
+                app.show_preview = app.managed_id.is_none()
+                    && app.selected_session().is_some_and(|session| {
+                        app.snapshots.first().is_some_and(|local| {
+                            ttybird::terminal_preview::unavailable_reason(session, &local.host)
+                                .is_none()
+                        })
+                    });
+                app.preview_text = None;
+                if app.notice.as_deref().is_some_and(|notice| {
+                    notice.starts_with("No terminal mapping")
+                        || notice.starts_with("No readable terminal mapping")
+                }) {
+                    app.notice = None;
+                }
+                redraw = true;
+            }
+        }
         if !app.refreshing && last_request.elapsed() >= Duration::from_secs(cli.interval) {
             if requests.try_send(()).is_ok() {
                 app.refreshing = true;
-                redraw = true;
             }
             last_request = Instant::now();
         }
@@ -1240,6 +1422,9 @@ fn interactive(
             redraw = true;
         }
         let selected = (app.show_preview
+            && !app.show_details
+            && !app.show_conversation
+            && !app.show_help
             && app.managed_id.is_none()
             && !app.liveness_unavailable
             && app.ghostty_picker.is_none()
@@ -1265,8 +1450,16 @@ fn interactive(
             preview_local = selected_is_local;
             preview_key = key;
             app.preview_text = None;
+            app.preview_capture_requested = selected
+                .as_ref()
+                .is_some_and(ttybird::terminal_preview::manual_snapshot);
             app.preview_notice = Some(
-                if selected.is_some() {
+                if selected
+                    .as_ref()
+                    .is_some_and(ttybird::terminal_preview::manual_snapshot)
+                {
+                    "Capturing Ghostty output…"
+                } else if selected.is_some() {
                     "Reading selected tmux screen…"
                 } else {
                     "Select a local tmux agent to preview its terminal."
@@ -1293,8 +1486,16 @@ fn interactive(
                             .min(text.lines.len().saturating_sub(1) as u16);
                         app.preview_text = Some(text);
                         app.preview_notice = Some(format!(
-                            "Updated {} · visible screen only",
-                            chrono::Local::now().format("%H:%M:%S")
+                            "Updated {} · {}",
+                            chrono::Local::now().format("%H:%M:%S"),
+                            if selected
+                                .as_ref()
+                                .is_some_and(ttybird::terminal_preview::manual_snapshot)
+                            {
+                                "exported output · 120 cols / last 200 rows · r captures again"
+                            } else {
+                                "visible screen only"
+                            }
                         ));
                     }
                     Err(error) => {
@@ -1305,6 +1506,8 @@ fn interactive(
             }
         }
         if let Some(session) = selected
+            && (!ttybird::terminal_preview::manual_snapshot(&session)
+                || app.preview_capture_requested)
             && !preview_busy
             && Instant::now() >= next_preview
         {
@@ -1329,6 +1532,11 @@ fn interactive(
                 .is_ok()
             {
                 preview_busy = true;
+                app.preview_capture_requested = false;
+                if ttybird::terminal_preview::manual_snapshot(app.selected_session().unwrap()) {
+                    app.preview_notice = Some("Capturing Ghostty output once…".into());
+                    redraw = true;
+                }
                 next_preview = Instant::now() + Duration::from_secs(2);
             }
         }
@@ -1617,7 +1825,51 @@ fn interactive(
             continue;
         }
         let previous_selection = app.selected_session().cloned();
+        // Do not forward input into a terminal whose shutdown was accepted.
+        if stop_query
+            .as_ref()
+            .is_some_and(|(id, _)| app.managed_id.as_ref() == Some(id))
+            && matches!(key.code, KeyCode::Enter | KeyCode::Char('i'))
+        {
+            app.notice = Some("Stopping owned terminal…".into());
+            continue;
+        }
         match key.code {
+            KeyCode::Char('x') => {
+                if stop_query.is_some() {
+                    app.notice = Some("A terminal stop request is still running.".into());
+                    continue;
+                }
+                let id = app
+                    .selected_session()
+                    .filter(|s| {
+                        app.snapshots
+                            .first()
+                            .is_some_and(|local| s.host == local.host)
+                    })
+                    .and_then(|s| match &s.target {
+                        Some(Target::Managed { session_id }) => Some(session_id.clone()),
+                        _ => None,
+                    });
+                if let Some(id) = id {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    let path = dir.to_path_buf();
+                    stop_query = Some((id.clone(), rx));
+                    app.terminal_input = false;
+                    app.notice = Some("Stopping owned terminal…".into());
+                    std::thread::spawn(move || {
+                        let result =
+                            managed::stop(&path, &id).map_err(|error| format!("{error:#}"));
+                        let _ = tx.send(result);
+                    });
+                } else {
+                    app.notice = Some(if app.managed_parent {
+                        "Select the parent terminal to stop it; this child has no separate terminal."
+                    } else {
+                        "x stops only a selected TTYbird-owned terminal; external terminals are unchanged."
+                    }.into());
+                }
+            }
             KeyCode::Char('q') => break,
             KeyCode::Esc => {
                 app.show_conversation = false;
@@ -1704,8 +1956,7 @@ fn interactive(
                         continue;
                     }
                     if app.selected_session().is_none() {
-                        app.notice =
-                            Some("Select a local tmux or owned terminal to preview.".into());
+                        app.notice = Some("Select a mapped local terminal to preview.".into());
                         continue;
                     }
                 }
@@ -1714,6 +1965,7 @@ fn interactive(
                 conversation_query = None;
                 preview_generation = preview_generation.wrapping_add(1);
                 app.show_preview = !app.show_preview;
+                app.notice = None;
                 app.preview_text = None;
                 preview_key = None;
             }
@@ -1798,7 +2050,19 @@ fn interactive(
                 app.show_background = !app.show_background;
                 app.restore_selection(previous_selection.as_ref());
             }
+            KeyCode::Char('r')
+                if app.show_preview
+                    && app
+                        .selected_session()
+                        .is_some_and(ttybird::terminal_preview::manual_snapshot) =>
+            {
+                if !preview_busy {
+                    app.preview_capture_requested = true;
+                    next_preview = Instant::now();
+                }
+            }
             KeyCode::Char('r') => {
+                owned_watch = None;
                 next_preview = Instant::now();
                 if !app.refreshing && requests.try_send(()).is_ok() {
                     app.refreshing = true;
@@ -1811,7 +2075,6 @@ fn interactive(
                 app.show_conversation = false;
                 app.show_help = false;
                 app.show_details = false;
-                owned_next_frame = Instant::now();
             }
             KeyCode::Enter | KeyCode::Char('g') => {
                 let relink = key.code == KeyCode::Char('g');
@@ -1851,7 +2114,6 @@ fn interactive(
                         app.show_conversation = false;
                         app.show_help = false;
                         app.show_details = false;
-                        owned_next_frame = Instant::now();
                         continue;
                     }
                     if session.target.is_none() || relink {
@@ -1904,10 +2166,14 @@ fn interactive(
     drop(preview_ready);
     drop(terminal);
     drop(guard);
+    drop(preview_worker);
     owned_client.finish();
     // Do not abandon the bounded AppleScript helper or a pending binding
     // rollback when q, Ctrl-C or terminal hangup occurs during navigation.
     if let Some(receiver) = focus_query {
+        let _ = receiver.recv();
+    }
+    if let Some((_, receiver)) = stop_query {
         let _ = receiver.recv();
     }
     if let Some((id, host)) = destination {
@@ -2124,11 +2390,48 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Stop { session }) => {
-            match managed::request(&dir, session, managed::Request::Stop)? {
-                managed::Response::Ok => println!("Stopped {session}"),
-                managed::Response::Error { message } => bail!("{message}"),
-                _ => bail!("unexpected stop response"),
+        Some(Commands::Stop { session, all }) => {
+            if *all {
+                let report = managed::stop_all(&dir)?;
+                if cli.json {
+                    let failed: Vec<_> = report
+                        .failed
+                        .iter()
+                        .map(
+                            |(id, error)| serde_json::json!({"session": id, "error": clean(error)}),
+                        )
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({"stopped": report.stopped, "failed": failed})
+                    );
+                } else {
+                    for id in &report.stopped {
+                        println!("Stopped {id}");
+                    }
+                    if report.stopped.is_empty() && report.failed.is_empty() {
+                        println!("No running TTYbird-owned terminals.");
+                    }
+                    for (id, error) in &report.failed {
+                        eprintln!("Could not stop {}: {}", clean(id), clean(error));
+                    }
+                }
+                if !report.failed.is_empty() {
+                    bail!(
+                        "{} owned terminal(s) could not be stopped",
+                        report.failed.len()
+                    );
+                }
+            } else if let Some(session) = session {
+                managed::stop(&dir, session)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"stopped": [session], "failed": []})
+                    );
+                } else {
+                    println!("Stopped {session}");
+                }
             }
         }
         Some(Commands::Tui) => {

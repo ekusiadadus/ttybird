@@ -19,8 +19,16 @@ reads `thread/read` with `includeTurns: false` for already discovered live-assoc
 sessions. It does not start a daemon, resume a thread, subscribe to conversation
 events, send input, or acknowledge approvals. Only runtime state is retained;
 preview/turn content returned by the protocol is discarded. The same-user Unix
-socket observer has a 1.5-second total I/O deadline, 64-thread limit, and bounded
-responses. It is compatible with the 0.154.0 protocol verified locally; older or
+socket queries have a 1.5-second total I/O deadline, a 64-thread limit, and bounded
+responses. The interactive dashboard keeps a passive connection for global
+`thread/status/changed` notifications after the initial reads. It does not attach
+to the thread's conversation/approval channel. Updates are coalesced by discovered
+session identity; events for untracked threads are ignored. On disconnection,
+the runtime cache is discarded and the raw log/process snapshot is restored.
+Reconnection bootstraps fresh state before publishing. Periodic process/log
+reconciliation remains necessary to discover new sessions and observe exits.
+Static and JSON collectors retain bounded one-shot reads. Passive global broadcast
+is verified against the 0.154.0 implementation, not a guarantee for future versions. It is compatible with the 0.154.0 protocol verified locally; older or
 embedded Codex instances fall back to log evidence. `notLoaded` from one server
 does not prove that a session in another server has ended.
 

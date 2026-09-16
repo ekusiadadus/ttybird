@@ -56,15 +56,15 @@ are required for Ghostty navigation; macOS may request Automation permission.
 Ghostty focus leaves TTYbird running in its original pane. Return to that pane
 to select another agent; `q` closes the dashboard.
 
-For a split view, press `p`: the agent list stays on the left and the selected
+Selecting a supported local terminal opens a split view: the agent list stays on the left and the selected
 local tmux pane's screen appears on the right, refreshing every two seconds.
 This preview is read-only; Enter returns to the actual terminal for typing.
 It needs a window at least 105 columns wide (narrower windows stack the views).
-Plain Ghostty tabs do not expose a supported live screen-reading API; run the
-agent inside tmux in Ghostty to use the preview. Unsupported selections keep
-the session summary visible. For a new embedded terminal without tmux, use
-`ttybird run -- codex`. A failed or outdated Ghostty binding can be replaced
-with `g`; select the correct pane explicitly.
+Selecting an existing mapped Ghostty tab on macOS shows a snapshot directly.
+Press `r` to refresh or `p` to hide/show the preview. This uses Ghostty's
+UUID-directed VT file export and includes scrollback, not an exact viewport.
+It does not automatically refresh. For a new interactive embedded terminal,
+use `ttybird run -- codex`. Replace an outdated Ghostty binding with `g`.
 
 Nix users can build the pinned package or enter the dev shell; see [Nix](docs/NIX.md).
 For a source build, install Rust 1.90+ and **Zig 0.15.2**:
@@ -91,22 +91,38 @@ ttybird run --detach --name review -- codex
 ttybird sessions
 ttybird attach SESSION_ID
 ttybird stop SESSION_ID
+# End all terminals launched by TTYbird (not independently launched agents):
+ttybird stop --all
 ```
 
 The agent list stays on the left. **Enter or i** puts the selected owned terminal
 in **INPUT** mode; keys, Ctrl-C and pasted text go to that program. **Ctrl+]**
-returns to the list. **q in the list** detaches without stopping the program.
-Use `stop` to end an owned session. This does not import already-running Ghostty
+returns to the list. **x in the list** stops the selected owned terminal and keeps
+TTYbird open. Select the parent terminal to stop it, not a logical subagent.
+**q in the list** detaches without stopping the program.
+Use `stop SESSION_ID` to end one owned session or `stop --all` to end all owned
+sessions in the current config directory. These commands do not stop agents
+started independently in Ghostty or other terminals. This does not import already-running Ghostty
 tabs: launch through `run` when you want embedded display and input.
 
 One local helper per owned session retains the PTY and bounded libghostty-vt
 screen in memory while dashboards are closed. A private Unix socket carries
-screen snapshots and explicit input. Only identity metadata is saved to disk;
+an initial screen followed by output-triggered updates and explicit input.
+An idle terminal does not send repeated screen snapshots. Hiding the panel ends
+its subscription; reopening it reads the current screen. `r` reconnects a failed
+viewer. An older helper must be restarted explicitly to support streaming;
+TTYbird never restarts its program automatically. Only identity metadata is saved to disk;
 screen contents and command arguments are not logged. Host reboot/helper failure
 does not preserve a session. Multiple viewers share one PTY size; the most recent
 viewer resize applies. Embedded mouse input and terminal graphics are not supported.
 
 ## Controls
+
+The list groups sessions by workspace and keeps children beneath their parent.
+Activity changes do not move a root to another workspace group; refreshes preserve
+selection by session identity. Tree ordering and filtering are cached in memory
+until the session data or display filters change. This does not cache liveness
+checks or persist conversations and terminal screens.
 
 | Key | Action |
 |---|---|
@@ -116,7 +132,8 @@ viewer resize applies. Embedded mouse input and terminal graphics are not suppor
 | g | Relink the local Ghostty pane, including a child’s parent terminal |
 | Enter / i on an owned terminal | Enter INPUT mode in the right pane |
 | Ctrl+] in INPUT mode | Return to the list without stopping the program |
-| p | Toggle local tmux preview; PageUp/PageDown scroll the captured screen |
+| x in the list | Stop the selected TTYbird-owned terminal; keep the dashboard open |
+| p | Toggle terminal preview; Ghostty: r captures once; PageUp/PageDown scroll |
 | c | Recent local Codex/Claude messages, only when requested; Esc closes |
 | d | Full metadata and evidence |
 | H | Prepare and review a handoff before starting a new Codex session |
@@ -133,8 +150,11 @@ Space changes only branches that can reveal rows. `b` reveals retained children;
 recorded relationships remain in Details.
 
 On supported local Codex app-server sessions, `Working`, `Ready` (no active turn),
-and `Needs input` come from a read-only runtime query. No daemon or model is
-started. If that API is unavailable, `Active log` / `Last reply` describe the
+and `Needs input` come from the running server. The dashboard reads an initial
+snapshot, then receives `thread/status/changed` notifications over one local
+connection. Reconnection resynchronizes state; disconnect restores log evidence.
+No daemon or model is started. Process discovery and log metadata still refresh
+periodically, quietly in the background; static/JSON commands use bounded queries. If that API is unavailable, `Active log` / `Last reply` describe the
 latest recorded event; `Unknown` is not a claim that work stopped. The right pane
 shows the evidence source and age. See [state semantics](docs/LIVENESS.md).
 
@@ -199,9 +219,11 @@ The handoff does not stop or claim ownership of the source agent.
 
 - Process identity uses **PID + start time**. Session metadata supplies parent
   IDs and recorded models. A parent and child can share one process and TTY.
-- Codex/Claude use bounded local log samples; only optional Claude hooks
-  currently supply observed input notifications. Other supported CLIs expose
-  process metadata, with unknown activity. See [the adapter matrix](docs/PROVIDERS.md).
+- Codex uses its existing local control server when available: the dashboard
+  reads current state, then follows status notifications. On disconnect it falls
+  back to bounded log evidence. Claude uses bounded logs and optional hooks.
+  Observed input states come from the Codex server or Claude hooks; other CLIs
+  expose process metadata, with unknown activity. See [the adapter matrix](docs/PROVIDERS.md).
 - `log only` is history, hidden by default. Open logs do not prove that a child
   is currently running. Children with idle, ended or unknown activity are also
   hidden by default; `b` reveals them without claiming they are working.
@@ -234,25 +256,45 @@ not an identity merge: no PID, TTY or navigation binding is copied between them.
 
 ## libghostty-vt preview
 
-Press `p` on a session in a local tmux pane. A worker reads the visible screen
+Select a session in a local tmux pane; `p` toggles the preview. A worker reads the visible screen
 using `tmux capture-pane`, parses it with Ghostty's VT engine, and renders owned
 styled cells in Ratatui. It does not replay escape sequences to your terminal.
 The VT handle stays on the capture worker; no non-Send handles cross threads.
 
 ![Synthetic read-only terminal preview](docs/terminal-preview.png)
 
-The preview is opt-in, refreshes about every two seconds, and never sends input,
+The selected tmux preview refreshes about every two seconds and never sends input,
 approves requests, changes tmux buffers, or saves pane contents. It checks the
 process and pane identity before and after capture and discards stale results.
 Commands have a two-second deadline and 1 MiB output bound; panes are limited to
 500×200 cells. It shows a visible-screen snapshot, not continuous PTY output or
 full scrollback. Wide previews are clipped to the available dashboard width.
 
-**libghostty-vt does not extract screens from Ghostty.app.** Ghostty-only and SSH
-previews are not implemented. Ghostty focus uses AppleScript; tmux navigation
-uses the exact socket, pane and TTY. Supported rendering and limitations are
-listed in [validation](docs/VALIDATION.md). The [2026-09-16 upstream audit](docs/LIBGHOSTTY.md)
-compares the pinned Rust binding, released Ghostty and unreleased APIs.
+**Existing Ghostty tabs on macOS:** after mapping the correct pane, selecting
+the session captures one snapshot. `r` refreshes; `p` toggles the preview. TTYbird asks
+that exact terminal UUID to perform `write_screen_file:copy,vt`, reads the
+private generated file (at most 1 MiB), removes it, and renders the VT data
+with libghostty-vt at 120 columns and up to the latest 200 rows. No input or
+focus command is sent. This is exported output including scrollback; cursor,
+original wrapping and scroll position are not preserved as an exact mirror.
+
+The action temporarily changes the clipboard. TTYbird preserves up to 4 MiB
+of its representations in memory and restores them only when the clipboard
+still matches its export. It serializes its own export requests, but macOS
+provides no atomic clipboard compare-and-restore: concurrent copying or a
+helper crash/timeout can leave the path on the clipboard. An interrupted
+export can also leave a private temporary file. This route captures **on selection/open or explicit refresh only**;
+it is never part of background collection or periodic preview refresh.
+Normal dashboard exit waits for bounded capture cleanup. Content is not
+added to collection JSON, logs, or history.
+
+Selected and nonselected tabs, split panes, closed UUID rejection, native VT
+rendering, multi-format clipboard preservation and successful-path file
+cleanup were tested on Ghostty 1.3.1. See the
+[export checkpoints](docs/GHOSTTY-EXPORT-VALIDATION.md).
+SSH preview remains unavailable. libghostty-vt parses obtained bytes; it does
+not attach to Ghostty.app by itself. Supported rendering and limits are in
+[validation](docs/VALIDATION.md) and the [upstream audit](docs/LIBGHOSTTY.md).
 
 ## SSH, explicit bindings and hooks
 

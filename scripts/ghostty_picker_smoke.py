@@ -89,6 +89,7 @@ def main():
         bindings_path = os.path.join(root, "bindings.json")
         focus_path = os.path.join(root, "focused-uuid")
         fail_focus_path = os.path.join(root, "fail-focus")
+        export_path = os.path.join(root, "export-calls")
         try:
             for directory in ("empty-codex", "empty-claude", "fake-bin"):
                 os.makedirs(os.path.join(root, directory))
@@ -114,6 +115,11 @@ import json
 import os
 import sys
 
+if "JavaScript" in sys.argv and any("write_screen_file:copy,vt" in arg for arg in sys.argv):
+    with open({export_path!r}, "a") as file:
+        file.write(sys.argv[-3] + "\\n")
+    print(json.dumps({{"ok": False, "error": "terminal_not_found"}}))
+    raise SystemExit(0)
 if "JavaScript" in sys.argv:
     print(json.dumps([
         {{"id": {FIRST_UUID!r}, "cwd": {root!r}, "title": "synthetic matching pane"}},
@@ -364,7 +370,7 @@ sys.exit(code)
             os.write(master, b"\r")
             wait_for(b"Choose Ghostty pane")
             os.write(master, b"\x1b[B\r")
-            wait_for(b"TTYbird stays open")
+            wait_for(b"no longer exists")
             assert dashboard.poll() is None, "focus closed the dashboard"
             assert b"\x1b[?1049l" not in output, "focus left the alternate screen"
 
@@ -385,19 +391,34 @@ sys.exit(code)
                 focused = file.read().splitlines()
             assert focused == [SECOND_UUID], "focus did not receive exactly the chosen UUID"
 
-            # Ghostty exposes navigation metadata but no bounded screen API.
-            # Preview must explain that limitation without focusing again or
-            # replacing the normal session view with a blank preview panel.
+            # The newly mapped selection captures without p or confirmation.
+            wait_for(b"no longer exists")
+            drain(2.3)
+            with open(export_path) as file:
+                assert file.read().splitlines() == [SECOND_UUID], "mapped selection did not export exactly once"
+            assert b"Press r to capture" not in output, "preview added an extra prompt"
             output.clear()
-            os.write(master, b"p")
-            # Ratatui updates changed spans independently, so the last letter
-            # can be separated by a cursor-addressed write.
-            wait_for(b"cannot be embedd")
-            assert b"Enter opens it" in output
-            assert dashboard.poll() is None, "unsupported preview closed the dashboard"
-            assert b"Terminal preview \xc2\xb7 read-only" not in output
+            os.write(master, b"r")
+            drain(2.3)
+            with open(export_path) as file:
+                assert file.read().splitlines() == [SECOND_UUID, SECOND_UUID], "r did not refresh once"
+            assert dashboard.poll() is None, "snapshot failure closed the dashboard"
             with open(focus_path, encoding="utf-8") as file:
-                assert file.read().splitlines() == [SECOND_UUID]
+                assert file.read().splitlines() == [SECOND_UUID], "snapshot focused Ghostty"
+            os.write(master, b"p")
+            drain(0.2)
+            # Closing preview stays closed through routine collection refresh.
+            os.write(master, b"r")
+            drain(2.3)
+            with open(export_path) as file:
+                assert file.read().splitlines() == [SECOND_UUID, SECOND_UUID]
+            # p remains available to reopen and capture the same selection.
+            os.write(master, b"p")
+            drain(2.3)
+            with open(export_path) as file:
+                assert file.read().splitlines() == [SECOND_UUID] * 3
+            os.write(master, b"p")
+            drain(0.2)
 
             # Explicit relink is also cancellable. Opening the chooser from an
             # existing Ghostty mapping must not replace or focus that mapping.
@@ -445,7 +466,7 @@ sys.exit(code)
                         "dashboard_survived_picker_and_saved_focus": True,
                         "failed_focus_rolled_back_and_kept_dashboard": True,
                         "failed_focus_detail_visible": True,
-                        "ghostty_preview_explains_unavailable": True,
+                        "selected_ghostty_opens_without_p_and_does_not_poll": True,
                         "ghostty_preview_did_not_focus": True,
                         "cancelled_relink_preserved_binding": True,
                         "terminal_restored": True,

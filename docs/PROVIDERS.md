@@ -37,7 +37,7 @@ These identities cover the cited distribution forms. Package layouts, compiled w
 |---|---|---|---|
 | Same-user process, PID/start identity, cwd, TTY | Yes | Yes | Yes |
 | Provider session/log metadata | Bounded rollout sampling | Bounded transcript sampling | No |
-| Observed lifecycle source | No App Server subscription | Optional allowlisted hooks | No |
+| Observed lifecycle source | Existing local control server: initial read + passive status subscription in the dashboard; bounded reads in one-shot collection | Optional allowlisted hooks | No |
 | Activity claim | Observed/inferred only when existing evidence supports it; otherwise unknown | Observed/inferred only when existing evidence supports it; otherwise unknown | Always unknown |
 | Explicit Ghostty/tmux navigation | Yes | Yes | Yes, when bound to the exact live identity |
 | Local tmux visible-screen preview | Yes | Yes | Yes, when the exact process TTY matches the pane |

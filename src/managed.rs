@@ -7,9 +7,10 @@ use crate::managed_vt::{Engine, KeyInput, Screen};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     ffi::{CStr, OsStr},
     fs::{self, File, OpenOptions},
-    io::{ErrorKind, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -39,7 +40,11 @@ const MAX_ROWS: u16 = 80;
 const SOCKET_PATH_LIMIT: usize = 103;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const SERVER_CLIENT_TIMEOUT: Duration = Duration::from_millis(50);
+const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(33);
+const MAX_SCREEN_SUBSCRIBERS: usize = 8;
+const WATCH_QUEUE_LIMIT: usize = RESPONSE_LIMIT * 2 + 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -54,11 +59,20 @@ pub struct SessionInfo {
     pub tty: String,
     pub ended: bool,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub screen_watch: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopReport {
+    pub stopped: Vec<String>,
+    pub failed: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Frame { cols: u16, rows: u16 },
+    Watch { cols: u16, rows: u16 },
     Key { key: KeyInput },
     Paste { text: String },
     Stop,
@@ -69,6 +83,41 @@ pub enum Response {
     Frame { screen: Screen, ended: bool },
     Ok,
     Error { message: String },
+}
+
+/// A live, in-memory stream of screen changes for one explicitly owned PTY.
+///
+/// Each item is a newline-delimited [`Response`]. The daemon sends an initial
+/// frame, then sends only when PTY output, a resize, or process exit changes
+/// the visible screen. Dropping this value detaches without stopping the PTY.
+#[cfg(unix)]
+pub struct ScreenSubscription {
+    reader: BufReader<UnixStream>,
+    initial: Option<Response>,
+}
+
+#[cfg(unix)]
+pub(crate) struct SubscriptionCancel(UnixStream);
+
+#[cfg(unix)]
+impl SubscriptionCancel {
+    pub(crate) fn cancel(self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(unix)]
+impl ScreenSubscription {
+    pub fn read_next(&mut self) -> Result<Option<Response>> {
+        if let Some(response) = self.initial.take() {
+            return Ok(Some(response));
+        }
+        read_watch_response(&mut self.reader)
+    }
+
+    pub(crate) fn cancellation_handle(&self) -> Result<SubscriptionCancel> {
+        Ok(SubscriptionCancel(self.reader.get_ref().try_clone()?))
+    }
 }
 
 pub fn launch(config_dir: &Path, name: Option<&str>, command: &[String]) -> Result<SessionInfo> {
@@ -231,6 +280,7 @@ pub fn serve(config_dir: &Path, id: &str, name: Option<&str>, command: &[String]
                 tty,
                 ended: false,
                 exit_code: None,
+                screen_watch: true,
             };
             write_info(&metadata, &info)?;
             Ok(info)
@@ -298,6 +348,174 @@ pub fn list(config_dir: &Path) -> Result<Vec<SessionInfo>> {
     }
 }
 
+/// Stop every live terminal owned by this TTYbird configuration.
+///
+/// Individual failures are returned in the report so one stale helper does
+/// not prevent other verified sessions from stopping. This never falls back
+/// to signaling a PID directly: without the owning daemon and private socket,
+/// the process group cannot be revalidated safely.
+pub fn stop_all(config_dir: &Path) -> Result<StopReport> {
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
+        return Ok(StopReport::default());
+    }
+    #[cfg(unix)]
+    {
+        let mut report = StopReport::default();
+        let dir = config_dir.join("managed");
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(report),
+            Err(error) => return Err(error.into()),
+            Ok(_) => validate_session_dir(&dir)?,
+        }
+
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if validate_id(id).is_err() || metadata_path(&dir, id) != path {
+                continue;
+            }
+            match read_info(&path) {
+                Ok(info) if info.id == id => candidates.push(info),
+                Ok(_) => report
+                    .failed
+                    .push((id.to_owned(), "session metadata identity mismatch".into())),
+                Err(error) => report.failed.push((id.to_owned(), format!("{error:#}"))),
+            }
+        }
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+
+        for candidate in candidates {
+            match stop_owned_session(config_dir, &candidate) {
+                Ok(true) => report.stopped.push(candidate.id),
+                Ok(false) => {}
+                Err(error) => report.failed.push((candidate.id, format!("{error:#}"))),
+            }
+        }
+        report.failed.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(report)
+    }
+}
+
+/// Stop one verified TTYbird-owned terminal and wait for bounded cleanup.
+pub fn stop(config_dir: &Path, id: &str) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (config_dir, id);
+        bail!("managed terminal sessions require Unix")
+    }
+    #[cfg(unix)]
+    {
+        validate_id(id)?;
+        let dir = config_dir.join("managed");
+        validate_session_dir(&dir)?;
+        let expected = read_info(&metadata_path(&dir, id))?;
+        ensure!(expected.id == id, "session metadata identity mismatch");
+        stop_owned_session(config_dir, &expected).map(|_| ())
+    }
+}
+
+#[cfg(unix)]
+fn stop_owned_session(config_dir: &Path, expected: &SessionInfo) -> Result<bool> {
+    let dir = config_dir.join("managed");
+    validate_session_dir(&dir)?;
+    let current = read_info(&metadata_path(&dir, &expected.id))?;
+    ensure!(
+        current.id == expected.id,
+        "session metadata identity mismatch"
+    );
+    ensure!(
+        current.daemon_pid == expected.daemon_pid
+            && current.daemon_started_at == expected.daemon_started_at
+            && current.pid == expected.pid
+            && current.process_started_at == expected.process_started_at,
+        "session identity changed while stopping"
+    );
+    let socket = socket_path(&dir, &current.id)?;
+    let daemon_live =
+        crate::collect::process_identity(current.daemon_pid) == Some(current.daemon_started_at);
+    let child_live =
+        crate::collect::process_identity(current.pid) == Some(current.process_started_at);
+    if current.ended {
+        ensure!(
+            !child_live,
+            "session is marked ended but its recorded child is still running"
+        );
+        ensure!(
+            daemon_has_stopped(&current),
+            "session is marked ended but its server is still running"
+        );
+        match fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => bail!("session is marked ended but its socket still exists"),
+        }
+        return Ok(false);
+    }
+    if !daemon_live && !child_live {
+        // A crashed helper can leave active metadata behind after every owned
+        // process is already gone. There is nothing safe or necessary to kill.
+        return Ok(false);
+    }
+    ensure!(
+        daemon_live,
+        "session server identity is stale; refusing to signal the child directly"
+    );
+    ensure!(child_live, "session child identity is stale");
+    validate_socket(&socket)?;
+    match raw_request(&socket, &Request::Stop)? {
+        Response::Ok => {}
+        Response::Error { message } => bail!("{message}"),
+        Response::Frame { .. } => bail!("session server returned an invalid stop response"),
+    }
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        let ended = read_info(&metadata_path(&dir, &current.id))?;
+        ensure!(ended.id == current.id, "session metadata identity mismatch");
+        ensure!(
+            ended.daemon_pid == current.daemon_pid
+                && ended.daemon_started_at == current.daemon_started_at
+                && ended.pid == current.pid
+                && ended.process_started_at == current.process_started_at,
+            "session identity changed during cleanup"
+        );
+        let child_stopped =
+            crate::collect::process_identity(current.pid) != Some(current.process_started_at);
+        let socket_removed = match fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+            Ok(_) => false,
+        };
+        if ended.ended && child_stopped && daemon_has_stopped(&current) && socket_removed {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            bail!("session did not finish cleanup within 3 seconds");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn daemon_has_stopped(info: &SessionInfo) -> bool {
+    // Unit tests exercise `serve` in threads, so their synthetic session
+    // server shares the test process. Production servers are separate.
+    #[cfg(test)]
+    if info.daemon_pid == std::process::id() {
+        return true;
+    }
+    crate::collect::process_identity(info.daemon_pid) != Some(info.daemon_started_at)
+}
+
 pub fn request(config_dir: &Path, id: &str, request: Request) -> Result<Response> {
     #[cfg(not(unix))]
     {
@@ -306,25 +524,80 @@ pub fn request(config_dir: &Path, id: &str, request: Request) -> Result<Response
     }
     #[cfg(unix)]
     {
-        validate_id(id)?;
-        let dir = config_dir.join("managed");
-        validate_session_dir(&dir)?;
-        let info = read_info(&metadata_path(&dir, id))?;
-        ensure!(info.id == id, "session metadata identity mismatch");
-        ensure!(!info.ended, "session has ended");
-        ensure!(
-            crate::collect::process_identity(info.daemon_pid) == Some(info.daemon_started_at),
-            "session server identity is stale"
-        );
-        ensure!(
-            crate::collect::process_identity(info.pid) == Some(info.process_started_at),
-            "session child identity is stale"
-        );
-        let socket = socket_path(&dir, id)?;
-        validate_socket(&socket)?;
+        let (socket, _) = validated_session_socket(config_dir, id)?;
         raw_request(&socket, &request)
             .with_context(|| format!("exchange request with session {id}"))
     }
+}
+
+/// Subscribe to changes in an explicitly owned terminal's visible screen.
+#[cfg(unix)]
+pub fn subscribe(config_dir: &Path, id: &str, cols: u16, rows: u16) -> Result<ScreenSubscription> {
+    let (socket, info) = validated_session_socket(config_dir, id)?;
+    ensure!(
+        info.screen_watch,
+        "live screen updates are unavailable for this older session; restart it with the current ttybird"
+    );
+    let request = Request::Watch { cols, rows };
+    let data = serde_json::to_vec(&request)?;
+    ensure!(
+        data.len() <= REQUEST_LIMIT as usize,
+        "session request is too large"
+    );
+
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("connect screen subscription for session {id}"))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(&data)?;
+    stream.write_all(b"\n")?;
+
+    let mut reader = BufReader::new(stream);
+    let initial = read_watch_response(&mut reader)?
+        .context("session server closed before the initial screen frame")?;
+    match initial {
+        Response::Frame { .. } => {}
+        Response::Error { message }
+            if message.contains("unknown variant") && message.contains("Watch") =>
+        {
+            bail!(
+                "live screen updates are unavailable for this older session; restart it with the current ttybird"
+            )
+        }
+        Response::Error { message } => bail!("{message}"),
+        Response::Ok => bail!("session server did not start a screen subscription"),
+    }
+    reader.get_mut().set_read_timeout(None)?;
+    Ok(ScreenSubscription {
+        reader,
+        initial: Some(initial),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn subscribe(_config_dir: &Path, _id: &str, _cols: u16, _rows: u16) -> Result<()> {
+    bail!("managed terminal sessions require Unix")
+}
+
+#[cfg(unix)]
+fn validated_session_socket(config_dir: &Path, id: &str) -> Result<(PathBuf, SessionInfo)> {
+    validate_id(id)?;
+    let dir = config_dir.join("managed");
+    validate_session_dir(&dir)?;
+    let info = read_info(&metadata_path(&dir, id))?;
+    ensure!(info.id == id, "session metadata identity mismatch");
+    ensure!(!info.ended, "session has ended");
+    ensure!(
+        crate::collect::process_identity(info.daemon_pid) == Some(info.daemon_started_at),
+        "session server identity is stale"
+    );
+    ensure!(
+        crate::collect::process_identity(info.pid) == Some(info.process_started_at),
+        "session child identity is stale"
+    );
+    let socket = socket_path(&dir, id)?;
+    validate_socket(&socket)?;
+    Ok((socket, info))
 }
 
 fn validate_command(name: Option<&str>, command: &[String]) -> Result<()> {
@@ -498,6 +771,47 @@ fn raw_request(socket: &Path, request: &Request) -> Result<Response> {
     let response =
         read_bounded(&mut stream, RESPONSE_LIMIT as u64).context("read session response")?;
     serde_json::from_slice(&response).context("invalid session response")
+}
+
+#[cfg(unix)]
+fn read_request(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut reader = BufReader::new(stream);
+    reader
+        .by_ref()
+        .take(REQUEST_LIMIT + 2)
+        .read_until(b'\n', &mut data)?;
+    if data.last() == Some(&b'\n') {
+        data.pop();
+    }
+    ensure!(
+        data.len() as u64 <= REQUEST_LIMIT,
+        "message exceeds size limit"
+    );
+    Ok(data)
+}
+
+#[cfg(unix)]
+fn read_watch_response(reader: &mut BufReader<UnixStream>) -> Result<Option<Response>> {
+    let mut data = Vec::new();
+    let count = reader
+        .by_ref()
+        .take(RESPONSE_LIMIT as u64 + 2)
+        .read_until(b'\n', &mut data)
+        .context("read managed screen update")?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if data.last() == Some(&b'\n') {
+        data.pop();
+    }
+    ensure!(
+        data.len() <= RESPONSE_LIMIT,
+        "session response is too large"
+    );
+    serde_json::from_slice(&data)
+        .context("invalid managed screen update")
+        .map(Some)
 }
 
 #[cfg(unix)]
@@ -738,6 +1052,106 @@ fn serve_startup_error(listener: &UnixListener, message: String) {
 }
 
 #[cfg(unix)]
+struct ScreenSubscriber {
+    stream: UnixStream,
+    queue: VecDeque<Arc<[u8]>>,
+    queue_bytes: usize,
+    offset: usize,
+}
+
+#[cfg(unix)]
+impl ScreenSubscriber {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            queue: VecDeque::new(),
+            queue_bytes: 0,
+            offset: 0,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    fn enqueue(&mut self, frame: Arc<[u8]>) -> bool {
+        if self.queue_bytes.saturating_add(frame.len()) > WATCH_QUEUE_LIMIT {
+            return false;
+        }
+        self.queue_bytes += frame.len();
+        self.queue.push_back(frame);
+        true
+    }
+
+    fn flush(&mut self) -> bool {
+        while let Some(frame) = self.queue.front() {
+            match self.stream.write(&frame[self.offset..]) {
+                Ok(0) => return false,
+                Ok(count) => {
+                    self.offset += count;
+                    self.queue_bytes -= count;
+                    if self.offset == frame.len() {
+                        self.queue.pop_front();
+                        self.offset = 0;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return true,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    fn client_closed(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        match self.stream.read(&mut byte) {
+            Ok(0) => true,
+            // Subscribers never send messages after Watch. Treat any bytes as
+            // an explicit detach or a protocol violation and close promptly.
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => false,
+            Err(error) if error.kind() == ErrorKind::Interrupted => false,
+            Err(_) => true,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn valid_dimensions(cols: u16, rows: u16) -> bool {
+    cols > 0 && rows > 0 && cols <= MAX_COLS && rows <= MAX_ROWS
+}
+
+#[cfg(unix)]
+fn encode_watch_response(response: &Response) -> Result<Arc<[u8]>> {
+    let mut data = serde_json::to_vec(response)?;
+    ensure!(
+        data.len() <= RESPONSE_LIMIT,
+        "session response is too large"
+    );
+    data.push(b'\n');
+    Ok(data.into())
+}
+
+#[cfg(unix)]
+fn broadcast_screen(
+    subscribers: &mut Vec<ScreenSubscriber>,
+    engine: &mut Engine,
+    ended: bool,
+) -> Result<()> {
+    if subscribers.is_empty() {
+        return Ok(());
+    }
+    let frame = encode_watch_response(&Response::Frame {
+        screen: engine.snapshot()?,
+        ended,
+    })?;
+    subscribers
+        .retain_mut(|subscriber| subscriber.enqueue(Arc::clone(&frame)) && subscriber.flush());
+    Ok(())
+}
+
+#[cfg(unix)]
 fn run_daemon(
     listener: &UnixListener,
     mut master: File,
@@ -748,17 +1162,22 @@ fn run_daemon(
     let mut dimensions = (80, 24);
     let mut input = Vec::<u8>::new();
     let mut input_offset = 0usize;
+    let mut subscribers = Vec::<ScreenSubscriber>::new();
+    let mut screen_dirty = false;
+    let mut last_screen_publish = Instant::now() - SCREEN_PUBLISH_INTERVAL;
     loop {
         if termination.load(Ordering::SeqCst) {
+            broadcast_screen(&mut subscribers, &mut engine, true)?;
             terminate_child(child, master);
             return Ok(());
         }
         if child.try_wait().context("query session child")?.is_some() {
             drain_master(&mut master, &mut engine, &mut input, &mut input_offset)?;
+            broadcast_screen(&mut subscribers, &mut engine, true)?;
             return Ok(());
         }
         let pending = input.len().saturating_sub(input_offset);
-        let mut descriptors = [
+        let mut descriptors = vec![
             libc::pollfd {
                 fd: master.as_raw_fd(),
                 events: libc::POLLIN | if pending > 0 { libc::POLLOUT } else { 0 },
@@ -770,7 +1189,31 @@ fn run_daemon(
                 revents: 0,
             },
         ];
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 100) };
+        descriptors.extend(subscribers.iter().map(|subscriber| libc::pollfd {
+            fd: subscriber.stream.as_raw_fd(),
+            events: libc::POLLIN
+                | if subscriber.has_pending() {
+                    libc::POLLOUT
+                } else {
+                    0
+                },
+            revents: 0,
+        }));
+        let poll_timeout = if screen_dirty {
+            SCREEN_PUBLISH_INTERVAL
+                .saturating_sub(last_screen_publish.elapsed())
+                .as_millis()
+                .clamp(1, 100) as libc::c_int
+        } else {
+            100
+        };
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                poll_timeout,
+            )
+        };
         if result == -1 {
             let error = std::io::Error::last_os_error();
             if error.kind() == ErrorKind::Interrupted {
@@ -778,38 +1221,75 @@ fn run_daemon(
             }
             return Err(error).context("poll session PTY");
         }
-        if descriptors[0].revents & libc::POLLIN != 0 {
-            drain_master(&mut master, &mut engine, &mut input, &mut input_offset)?;
+        let subscriber_events = descriptors[2..]
+            .iter()
+            .map(|descriptor| descriptor.revents)
+            .collect::<Vec<_>>();
+        for (index, revents) in subscriber_events.into_iter().enumerate().rev() {
+            let disconnected = revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                || (revents & libc::POLLIN != 0 && subscribers[index].client_closed())
+                || (revents & libc::POLLOUT != 0 && !subscribers[index].flush());
+            if disconnected {
+                subscribers.swap_remove(index);
+            }
+        }
+        if descriptors[0].revents & libc::POLLIN != 0
+            && drain_master(&mut master, &mut engine, &mut input, &mut input_offset)?
+        {
+            screen_dirty = true;
         }
         if descriptors[0].revents & libc::POLLOUT != 0 {
             flush_input(&mut master, &mut input, &mut input_offset)?;
         }
         if descriptors[1].revents & libc::POLLIN != 0 {
             for _ in 0..16 {
-                let (mut stream, _) = match listener.accept() {
+                let (stream, _) = match listener.accept() {
                     Ok(value) => value,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                     Err(error) => return Err(error).context("accept session request"),
                 };
-                let stop = match handle_client(
-                    &mut stream,
+                let action = match handle_client(
+                    stream,
                     &mut master,
                     &mut engine,
                     &mut dimensions,
                     &mut input,
                     &mut input_offset,
+                    subscribers.len(),
                 ) {
-                    Ok(stop) => stop,
+                    Ok(action) => action,
                     Err(_) => continue,
                 };
-                if stop {
-                    terminate_child(child, master);
-                    return Ok(());
+                match action {
+                    ClientAction::Continue { screen_changed } => {
+                        if screen_changed {
+                            broadcast_screen(&mut subscribers, &mut engine, false)?;
+                            last_screen_publish = Instant::now();
+                            screen_dirty = false;
+                        }
+                    }
+                    ClientAction::Subscribe {
+                        subscriber,
+                        screen_changed,
+                    } => {
+                        if screen_changed {
+                            broadcast_screen(&mut subscribers, &mut engine, false)?;
+                            last_screen_publish = Instant::now();
+                            screen_dirty = false;
+                        }
+                        subscribers.push(subscriber);
+                    }
+                    ClientAction::Stop => {
+                        broadcast_screen(&mut subscribers, &mut engine, true)?;
+                        terminate_child(child, master);
+                        return Ok(());
+                    }
                 }
             }
         }
         if descriptors[0].revents & libc::POLLHUP != 0 {
             drain_master(&mut master, &mut engine, &mut input, &mut input_offset)?;
+            broadcast_screen(&mut subscribers, &mut engine, true)?;
             if child
                 .try_wait()
                 .context("query hung-up session child")?
@@ -825,43 +1305,115 @@ fn run_daemon(
         if descriptors[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
             bail!("session PTY failed");
         }
+        if screen_dirty && last_screen_publish.elapsed() >= SCREEN_PUBLISH_INTERVAL {
+            broadcast_screen(&mut subscribers, &mut engine, false)?;
+            last_screen_publish = Instant::now();
+            screen_dirty = false;
+        }
     }
 }
 
 #[cfg(unix)]
+enum ClientAction {
+    Continue {
+        screen_changed: bool,
+    },
+    Subscribe {
+        subscriber: ScreenSubscriber,
+        screen_changed: bool,
+    },
+    Stop,
+}
+
+#[cfg(unix)]
 fn handle_client(
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     master: &mut File,
     engine: &mut Engine,
     dimensions: &mut (u16, u16),
     input: &mut Vec<u8>,
     input_offset: &mut usize,
-) -> Result<bool> {
+    subscriber_count: usize,
+) -> Result<ClientAction> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(SERVER_CLIENT_TIMEOUT))?;
     stream.set_write_timeout(Some(SERVER_CLIENT_TIMEOUT))?;
-    let request = match read_bounded(stream, REQUEST_LIMIT)
+    let request = match read_request(&mut stream)
         .and_then(|data| serde_json::from_slice::<Request>(&data).map_err(Into::into))
     {
         Ok(request) => request,
         Err(error) => {
             let _ = write_response(
-                stream,
+                &mut stream,
                 &Response::Error {
                     message: format!("invalid request: {error}"),
                 },
             );
-            return Ok(false);
+            return Ok(ClientAction::Continue {
+                screen_changed: false,
+            });
         }
     };
     if matches!(request, Request::Stop) {
-        write_response(stream, &Response::Ok)?;
-        return Ok(true);
+        write_response(&mut stream, &Response::Ok)?;
+        return Ok(ClientAction::Stop);
     }
+    if let Request::Watch { cols, rows } = &request {
+        if subscriber_count >= MAX_SCREEN_SUBSCRIBERS {
+            write_response(
+                &mut stream,
+                &Response::Error {
+                    message: "too many screen subscribers".into(),
+                },
+            )?;
+            return Ok(ClientAction::Continue {
+                screen_changed: false,
+            });
+        }
+        if !valid_dimensions(*cols, *rows) {
+            write_response(
+                &mut stream,
+                &Response::Error {
+                    message: "terminal dimensions are out of range".into(),
+                },
+            )?;
+            return Ok(ClientAction::Continue {
+                screen_changed: false,
+            });
+        }
+        let resized = *dimensions != (*cols, *rows);
+        if resized {
+            resize_pty(master.as_raw_fd(), *cols, *rows)?;
+            engine.resize(*cols, *rows)?;
+            *dimensions = (*cols, *rows);
+        }
+        let drained = drain_master(master, engine, input, input_offset)?;
+        flush_input(master, input, input_offset)?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        let initial = encode_watch_response(&Response::Frame {
+            screen: engine.snapshot()?,
+            ended: false,
+        })?;
+        let mut subscriber = ScreenSubscriber::new(stream);
+        ensure!(
+            subscriber.enqueue(initial),
+            "initial screen frame exceeds queue limit"
+        );
+        if !subscriber.flush() {
+            bail!("screen subscriber disconnected during setup");
+        }
+        return Ok(ClientAction::Subscribe {
+            subscriber,
+            screen_changed: resized || drained,
+        });
+    }
+    let mut screen_changed = false;
     let response = (|| -> Result<Response> {
         Ok(match request {
             Request::Frame { cols, rows } => {
-                if cols == 0 || rows == 0 || cols > MAX_COLS || rows > MAX_ROWS {
+                if !valid_dimensions(cols, rows) {
                     Response::Error {
                         message: "terminal dimensions are out of range".into(),
                     }
@@ -870,8 +1422,9 @@ fn handle_client(
                         resize_pty(master.as_raw_fd(), cols, rows)?;
                         engine.resize(cols, rows)?;
                         *dimensions = (cols, rows);
+                        screen_changed = true;
                     }
-                    drain_master(master, engine, input, input_offset)?;
+                    screen_changed |= drain_master(master, engine, input, input_offset)?;
                     Response::Frame {
                         screen: engine.snapshot()?,
                         ended: false,
@@ -901,6 +1454,7 @@ fn handle_client(
                 },
             },
             Request::Stop => unreachable!("stop was handled above"),
+            Request::Watch { .. } => unreachable!("watch was handled above"),
         })
     })()
     .unwrap_or_else(|error| Response::Error {
@@ -908,15 +1462,17 @@ fn handle_client(
     });
     if let Err(error) = flush_input(master, input, input_offset) {
         write_response(
-            stream,
+            &mut stream,
             &Response::Error {
                 message: error.to_string(),
             },
         )?;
-        return Ok(false);
+        return Ok(ClientAction::Continue {
+            screen_changed: false,
+        });
     }
-    write_response(stream, &response)?;
-    Ok(false)
+    write_response(&mut stream, &response)?;
+    Ok(ClientAction::Continue { screen_changed })
 }
 
 #[cfg(unix)]
@@ -925,13 +1481,15 @@ fn drain_master(
     engine: &mut Engine,
     input: &mut Vec<u8>,
     input_offset: &mut usize,
-) -> Result<()> {
+) -> Result<bool> {
     let mut buffer = [0u8; 32 * 1024];
+    let mut changed = false;
     for _ in 0..16 {
         match master.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
                 engine.feed(&buffer[..count])?;
+                changed = true;
                 let replies = engine.replies();
                 queue_input(input, input_offset, replies)?;
             }
@@ -940,7 +1498,7 @@ fn drain_master(
             Err(error) => return Err(error).context("read session PTY"),
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(unix)]
@@ -1067,6 +1625,25 @@ mod tests {
         assert_eq!(read_bounded(&mut &b"123"[..], 3).unwrap(), b"123");
     }
 
+    #[test]
+    fn older_metadata_defaults_screen_watch_to_disabled() {
+        let value = serde_json::json!({
+            "id": "old",
+            "name": null,
+            "program": "sh",
+            "cwd": "/tmp",
+            "pid": 1,
+            "process_started_at": 1,
+            "daemon_pid": 2,
+            "daemon_started_at": 2,
+            "tty": "/dev/pts/1",
+            "ended": false,
+            "exit_code": null
+        });
+        let info: SessionInfo = serde_json::from_value(value).unwrap();
+        assert!(!info.screen_watch);
+    }
+
     #[cfg(unix)]
     #[test]
     fn metadata_permissions_are_private() {
@@ -1085,6 +1662,7 @@ mod tests {
             tty: "/dev/pts/1".into(),
             ended: true,
             exit_code: Some(0),
+            screen_watch: true,
         };
         write_info(&path, &info).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
@@ -1173,14 +1751,200 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(saw_echo, "PTY input did not reach the child");
-        assert!(matches!(
-            request(&root, id, Request::Stop).unwrap(),
-            Response::Ok
-        ));
+        stop(&root, id).unwrap();
         server.join().unwrap().unwrap();
         assert!(!root.join("managed/integration.sock").exists());
         let ended = read_info(&root.join("managed/integration.json")).unwrap();
         assert!(ended.ended);
+        stop(&root, id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_all_stops_owned_sessions_and_never_signals_an_orphan_child() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().to_owned();
+        let mut servers = Vec::new();
+        for id in ["stop-all-a", "stop-all-b"] {
+            let server_root = root.clone();
+            servers.push(thread::spawn(move || {
+                serve(
+                    &server_root,
+                    id,
+                    None,
+                    &["sh".into(), "-c".into(), "while :; do sleep 1; done".into()],
+                )
+            }));
+            let deadline = Instant::now() + STARTUP_TIMEOUT;
+            while !root.join(format!("managed/{id}.json")).exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "session metadata was not created"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let unrelated_started = wait_for_identity(unrelated.id()).unwrap();
+        let managed_dir = root.join("managed");
+        write_info(
+            &metadata_path(&managed_dir, "orphan"),
+            &SessionInfo {
+                id: "orphan".into(),
+                name: None,
+                program: "sleep".into(),
+                cwd: root.clone(),
+                pid: unrelated.id(),
+                process_started_at: unrelated_started,
+                daemon_pid: u32::MAX,
+                daemon_started_at: 1,
+                tty: "/dev/null".into(),
+                ended: false,
+                exit_code: None,
+                screen_watch: true,
+            },
+        )
+        .unwrap();
+
+        let report = stop_all(&root).unwrap();
+        assert_eq!(report.stopped, ["stop-all-a", "stop-all-b"]);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "orphan");
+        assert!(report.failed[0].1.contains("server identity is stale"));
+        assert_eq!(
+            crate::collect::process_identity(unrelated.id()),
+            Some(unrelated_started),
+            "an unrelated process referenced by stale metadata was stopped"
+        );
+        for server in servers {
+            server.join().unwrap().unwrap();
+        }
+
+        fs::remove_file(metadata_path(&managed_dir, "orphan")).unwrap();
+        assert_eq!(stop_all(&root).unwrap(), StopReport::default());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn screen_subscription_emits_on_output_not_idle_and_reattaches() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let root = directory.path().to_owned();
+        let server_root = root.clone();
+        let id = "watch-integration";
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'watch-ready\\n'; while IFS= read -r line; do printf 'watch:%s\\n' \"$line\"; done"
+                .to_owned(),
+        ];
+        let server = thread::spawn(move || serve(&server_root, id, None, &command));
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while !root.join("managed/watch-integration.json").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "session metadata was not created"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        let mut subscription = subscribe(&root, id, 80, 24).unwrap();
+        let Some(Response::Frame { screen, ended }) = subscription.read_next().unwrap() else {
+            panic!("expected initial subscription frame");
+        };
+        assert!(!ended);
+        assert!(screen.vt.contains("watch-ready"));
+
+        let cancellation = subscription.cancellation_handle().unwrap();
+        let (updates, received) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            loop {
+                let update = subscription.read_next();
+                let done = matches!(
+                    &update,
+                    Ok(Some(Response::Frame { screen, .. }))
+                        if screen.vt.contains("watch:changed")
+                ) || !matches!(&update, Ok(Some(Response::Frame { ended: false, .. })));
+                if done {
+                    updates.send(update).unwrap();
+                    break;
+                }
+            }
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            request(
+                &root,
+                id,
+                Request::Paste {
+                    text: "changed\n".into()
+                }
+            )
+            .unwrap(),
+            Response::Ok
+        ));
+        let update = received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let Some(Response::Frame { screen, ended }) = update else {
+            panic!("expected output-triggered subscription frame");
+        };
+        assert!(!ended);
+        assert!(screen.vt.contains("watch:changed"));
+        cancellation.cancel();
+        reader.join().unwrap();
+
+        // Repeated detach/reattach must not consume the daemon's bounded
+        // subscriber slots.
+        for _ in 0..MAX_SCREEN_SUBSCRIBERS + 1 {
+            let mut next = subscribe(&root, id, 90, 28).unwrap();
+            assert!(matches!(
+                next.read_next().unwrap(),
+                Some(Response::Frame { .. })
+            ));
+            drop(next);
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut final_subscription = subscribe(&root, id, 90, 28).unwrap();
+        assert!(matches!(
+            final_subscription.read_next().unwrap(),
+            Some(Response::Frame { ended: false, .. })
+        ));
+        assert!(matches!(
+            request(&root, id, Request::Stop).unwrap(),
+            Response::Ok
+        ));
+        assert!(matches!(
+            final_subscription.read_next().unwrap(),
+            Some(Response::Frame { ended: true, .. })
+        ));
+        server.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_screen_subscriber_has_bounded_nonblocking_queue() {
+        let (stream, _slow_peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut subscriber = ScreenSubscriber::new(stream);
+        let frame: Arc<[u8]> = vec![b'x'; RESPONSE_LIMIT].into();
+        assert!(subscriber.enqueue(Arc::clone(&frame)));
+        let started = Instant::now();
+        assert!(subscriber.flush());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "nonblocking subscriber flush stalled the PTY daemon"
+        );
+        assert!(subscriber.enqueue(Arc::clone(&frame)));
+        assert!(!subscriber.enqueue(frame));
     }
 
     #[cfg(unix)]

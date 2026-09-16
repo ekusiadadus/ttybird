@@ -2,6 +2,7 @@ pub mod attention;
 pub mod codex_status;
 pub mod collect;
 pub mod config;
+pub mod ghostty_export;
 pub mod handoff;
 pub mod handoff_view;
 pub mod managed;

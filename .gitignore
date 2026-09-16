@@ -6,3 +6,5 @@ __pycache__/
 /result
 /result-*
 /dist/
+docs/research/
+docs/verification/

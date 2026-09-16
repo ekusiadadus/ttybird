@@ -51,6 +51,7 @@
       ../Cargo.lock
       ../LICENSE
       ../src
+      ../scripts/ghostty_export.js
       ../tests
       ../examples
     ];

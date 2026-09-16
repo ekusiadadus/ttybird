@@ -152,3 +152,26 @@ fn provider_catalog_distinguishes_process_support_from_log_support() {
     }
     assert!(!dir.path().join("config.toml").exists());
 }
+
+#[test]
+fn stopping_owned_terminals_requires_an_explicit_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [vec!["stop"], vec!["stop", "some-session", "--all"]] {
+        let out = command(dir.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+    }
+    let out = command(dir.path())
+        .args(["--json", "stop", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        serde_json::json!({"stopped": [], "failed": []})
+    );
+    assert!(!dir.path().join("managed").exists());
+}

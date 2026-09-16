@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -51,6 +52,7 @@ pub struct App {
     pub preview_text: Option<Text<'static>>,
     pub preview_notice: Option<String>,
     pub preview_scroll: u16,
+    pub preview_capture_requested: bool,
     pub show_conversation: bool,
     pub conversation_text: Option<String>,
     pub collapsed: HashSet<(String, Provider, String)>,
@@ -61,6 +63,47 @@ pub struct App {
     pub managed_cursor: Option<(u16, u16)>,
     pub managed_notice: Option<String>,
     pub terminal_input: bool,
+    #[doc(hidden)]
+    pub row_revision: u64,
+    #[doc(hidden)]
+    pub row_cache: RefCell<RowCache>,
+}
+
+type SessionKey = (String, Provider, String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionLocation {
+    snapshot: usize,
+    session: usize,
+}
+
+#[derive(Clone)]
+struct CachedTreeRow {
+    session: SessionLocation,
+    parent: Option<SessionLocation>,
+    depth: usize,
+    ancestor_has_more: Vec<bool>,
+    is_last: bool,
+    child_count: usize,
+    visible_child_count: usize,
+    working_children: usize,
+    collapsed: bool,
+}
+
+#[derive(Default)]
+#[doc(hidden)]
+pub struct RowCache {
+    revision: u64,
+    query: String,
+    needs_only: bool,
+    show_background: bool,
+    show_history: bool,
+    live_only: bool,
+    collapsed: HashSet<SessionKey>,
+    rows: Vec<CachedTreeRow>,
+    valid: bool,
+    #[cfg(test)]
+    builds: usize,
 }
 
 /// A subagent often has no independent terminal. Use the recorded ancestry,
@@ -98,7 +141,7 @@ fn enter_hint(session: &Session, snapshots: &[Snapshot]) -> String {
             "Enter: operate PARENT terminal · c: read this child's conversation".into()
         }
         Some(target) if matches!(target.target, Some(Target::Managed { .. })) => {
-            "Enter: operate owned terminal · Ctrl+]: return to list".into()
+            "Enter: type · x: stop this terminal · q: detach TTYbird".into()
         }
         Some(target) if target.id != session.id && target.target.is_some() => {
             "Enter: open parent terminal · c: read this child's conversation".into()
@@ -133,7 +176,15 @@ impl App {
         let previous = self.selected_session().cloned();
         self.snapshots = snapshots;
         self.liveness_unavailable = false;
+        self.invalidate_rows();
         self.restore_selection(previous.as_ref());
+    }
+
+    /// Invalidate the single in-memory tree projection after direct session
+    /// mutation. `set_snapshots` and `invalidate_liveness` do this themselves.
+    pub fn invalidate_rows(&mut self) {
+        self.row_revision = self.row_revision.wrapping_add(1);
+        self.row_cache.get_mut().valid = false;
     }
 
     pub fn invalidate_liveness(&mut self) {
@@ -144,6 +195,7 @@ impl App {
         self.conversation_text = None;
         self.preview_scroll = 0;
         self.preview_notice = Some("Current liveness unavailable; preview paused.".into());
+        self.preview_capture_requested = false;
         for snapshot in &mut self.snapshots {
             for session in &mut snapshot.sessions {
                 session.pid = None;
@@ -155,6 +207,7 @@ impl App {
                 session.evidence = "Last observation retained after collection failure; current liveness unavailable".into();
             }
         }
+        self.invalidate_rows();
         self.move_selection(0);
     }
 
@@ -169,17 +222,12 @@ impl App {
             .iter()
             .map(|session| (session_key(session), hierarchy_key(session, &universe)))
             .collect();
-        let mut group_ranks = HashMap::new();
         let mut group_workspaces = HashMap::new();
         for session in &universe {
             let Some((root_id, _)) = hierarchy.get(&session_key(session)) else {
                 continue;
             };
             let group_key = (session.host.clone(), session.provider, root_id.clone());
-            group_ranks
-                .entry(group_key.clone())
-                .and_modify(|rank: &mut u8| *rank = (*rank).min(state_rank(session)))
-                .or_insert_with(|| state_rank(session));
             if session.id == *root_id {
                 group_workspaces.insert(group_key, workspace(session));
             }
@@ -217,39 +265,27 @@ impl App {
                 right.provider,
                 right_hierarchy.0.clone(),
             );
-            group_ranks
+            group_workspaces
                 .get(&left_group)
-                .copied()
-                .unwrap_or_else(|| state_rank(left))
+                .cloned()
+                .unwrap_or_else(|| workspace(left))
                 .cmp(
-                    &group_ranks
+                    &group_workspaces
                         .get(&right_group)
-                        .copied()
-                        .unwrap_or_else(|| state_rank(right)),
-                )
-                .then_with(|| {
-                    group_workspaces
-                        .get(&left_group)
                         .cloned()
-                        .unwrap_or_else(|| workspace(left))
-                        .cmp(
-                            &group_workspaces
-                                .get(&right_group)
-                                .cloned()
-                                .unwrap_or_else(|| workspace(right)),
-                        )
-                })
-                .then_with(|| provider_label(&left.provider).cmp(provider_label(&right.provider)))
+                        .unwrap_or_else(|| workspace(right)),
+                )
                 .then_with(|| left.host.cmp(&right.host))
-                .then_with(|| left_hierarchy.cmp(&right_hierarchy))
-                .then_with(|| state_rank(left).cmp(&state_rank(right)))
+                .then_with(|| provider_label(&left.provider).cmp(provider_label(&right.provider)))
+                .then_with(|| left_hierarchy.0.cmp(&right_hierarchy.0))
+                .then_with(|| left_hierarchy.1.cmp(&right_hierarchy.1))
                 .then_with(|| workspace(left).cmp(&workspace(right)))
                 .then_with(|| left.id.cmp(&right.id))
         });
         rows
     }
 
-    fn tree_rows(&self) -> Vec<TreeRow<'_>> {
+    fn build_tree_rows(&self) -> Vec<TreeRow<'_>> {
         let sorted = self.sorted_sessions();
         let universe: Vec<_> = self
             .snapshots
@@ -329,19 +365,119 @@ impl App {
         rows
     }
 
-    pub fn rows(&self) -> Vec<&Session> {
-        self.tree_rows()
+    fn row_cache_matches(&self, cache: &RowCache) -> bool {
+        cache.valid
+            && cache.revision == self.row_revision
+            && cache.query == self.query
+            && cache.needs_only == self.needs_only
+            && cache.show_background == self.show_background
+            && cache.show_history == self.show_history
+            && cache.live_only == self.live_only
+            && cache.collapsed == self.collapsed
+    }
+
+    fn ensure_row_cache(&self) {
+        if self.row_cache_matches(&self.row_cache.borrow()) {
+            return;
+        }
+
+        let locations: HashMap<_, _> = self
+            .snapshots
+            .iter()
+            .enumerate()
+            .flat_map(|(snapshot, value)| {
+                value
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .map(move |(session, value)| {
+                        (session_key(value), SessionLocation { snapshot, session })
+                    })
+            })
+            .collect();
+        let rows = self
+            .build_tree_rows()
             .into_iter()
-            .map(|row| row.session)
+            .filter_map(|row| {
+                Some(CachedTreeRow {
+                    session: *locations.get(&session_key(row.session))?,
+                    parent: row
+                        .parent
+                        .and_then(|parent| locations.get(&session_key(parent)).copied()),
+                    depth: row.depth,
+                    ancestor_has_more: row.ancestor_has_more,
+                    is_last: row.is_last,
+                    child_count: row.child_count,
+                    visible_child_count: row.visible_child_count,
+                    working_children: row.working_children,
+                    collapsed: row.collapsed,
+                })
+            })
+            .collect();
+        let mut cache = self.row_cache.borrow_mut();
+        cache.revision = self.row_revision;
+        cache.query.clone_from(&self.query);
+        cache.needs_only = self.needs_only;
+        cache.show_background = self.show_background;
+        cache.show_history = self.show_history;
+        cache.live_only = self.live_only;
+        cache.collapsed.clone_from(&self.collapsed);
+        cache.rows = rows;
+        cache.valid = true;
+        #[cfg(test)]
+        {
+            cache.builds += 1;
+        }
+    }
+
+    fn session_at(&self, location: SessionLocation) -> Option<&Session> {
+        self.snapshots
+            .get(location.snapshot)?
+            .sessions
+            .get(location.session)
+    }
+
+    fn tree_rows(&self) -> Vec<TreeRow<'_>> {
+        self.ensure_row_cache();
+        let cache = self.row_cache.borrow();
+        cache
+            .rows
+            .iter()
+            .filter_map(|row| {
+                Some(TreeRow {
+                    session: self.session_at(row.session)?,
+                    parent: row.parent.and_then(|parent| self.session_at(parent)),
+                    depth: row.depth,
+                    ancestor_has_more: row.ancestor_has_more.clone(),
+                    is_last: row.is_last,
+                    child_count: row.child_count,
+                    visible_child_count: row.visible_child_count,
+                    working_children: row.working_children,
+                    collapsed: row.collapsed,
+                })
+            })
+            .collect()
+    }
+
+    pub fn rows(&self) -> Vec<&Session> {
+        self.ensure_row_cache();
+        self.row_cache
+            .borrow()
+            .rows
+            .iter()
+            .filter_map(|row| self.session_at(row.session))
             .collect()
     }
 
     pub fn selected_session(&self) -> Option<&Session> {
-        self.rows().get(self.selected).copied()
+        self.ensure_row_cache();
+        let location = self.row_cache.borrow().rows.get(self.selected)?.session;
+        self.session_at(location)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        let count = self.rows().len();
+        self.ensure_row_cache();
+        let count = self.row_cache.borrow().rows.len();
         if count == 0 {
             self.selected = 0;
             return;
@@ -707,20 +843,6 @@ fn model_label(session: &Session) -> String {
 
 fn is_attention(session: &Session) -> bool {
     session.activity == Activity::WaitingInput && session.confidence == Confidence::Observed
-}
-
-fn state_rank(session: &Session) -> u8 {
-    if is_attention(session) {
-        return 0;
-    }
-    match session.activity {
-        Activity::Working => 1,
-        Activity::WaitingTool => 2,
-        Activity::Idle => 3,
-        Activity::Unknown => 4,
-        Activity::Ended => 5,
-        Activity::WaitingInput => 6,
-    }
 }
 
 fn matches_query(session: &Session, query: &str) -> bool {
@@ -1096,8 +1218,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, shown: usize) {
     if !app.show_background && hidden_raw > 0 {
         summary.push_str(&format!("  ·  {hidden_raw} auxiliary processes (b)"));
     }
-    if app.refreshing {
-        summary.push_str("  ·  refreshing…");
+    if app.refreshing && app.snapshots.is_empty() {
+        summary.push_str("  ·  discovering agents…");
     }
 
     let line = Line::from(vec![
@@ -1541,7 +1663,7 @@ fn render_details(
             Line::from(format!("Terminal   {}", terminal_label(session))),
             Line::from(""),
             Line::from("c  Recent conversation (local, opt-in)"),
-            Line::from("p  Read-only terminal preview"),
+            Line::from("p  Show terminal preview"),
             Line::from("d  Process identity and evidence"),
             Line::from("H  Prepare a reviewed handoff → Codex"),
             Line::from("N  Attention inbox · read / acknowledge / snooze"),
@@ -1593,7 +1715,15 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(SLATE),
         )))
     });
-    let mut block = border_block("Terminal preview · read-only");
+    let title = if app
+        .selected_session()
+        .is_some_and(crate::terminal_preview::manual_snapshot)
+    {
+        "Ghostty snapshot · r refreshes · p/Esc closes"
+    } else {
+        "Terminal preview · read-only"
+    };
+    let mut block = border_block(title);
     if has_preview && let Some(notice) = app.preview_notice.as_deref() {
         block = block.title_bottom(
             Line::from(Span::styled(
@@ -1688,8 +1818,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.managed_id.is_some() {
         if app.terminal_input {
             "INPUT → owned terminal · Ctrl+] returns to list · Ctrl-C goes to the program"
+        } else if app.managed_parent {
+            "↑↓/jk choose · Enter/i type in PARENT · select parent to stop · q detach · ? help"
         } else {
-            "↑↓/jk choose · Enter/i type in terminal · H handoff · N inbox · q detach · ? help"
+            "↑↓/jk choose · Enter/i type · x stop terminal · q detach · ? help"
         }
     } else if app.show_preview {
         if area.width < 72 {
@@ -1743,9 +1875,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("Enter        Open its terminal; children without one use their parent"),
         Line::from("Enter / i    Owned terminal: enter INPUT mode in the right pane"),
         Line::from("Ctrl+]       Leave INPUT mode; q in the list detaches"),
+        Line::from("x            Stop selected owned terminal; TTYbird stays open"),
         Line::from("H / N        Reviewed handoff / attention inbox"),
         Line::from("g            Relink the Ghostty terminal (also for a child's parent)"),
-        Line::from("p            Read-only terminal preview; PageUp/PageDown scroll"),
+        Line::from("p            Show terminal preview; r refreshes; PgUp/PgDn scroll"),
         Line::from("d            Full details; arrows/PageUp/PageDown scroll"),
         Line::from("/            Search sessions"),
         Line::from("a            Observed needs-input sessions only"),
@@ -1878,7 +2011,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let count = app.tree_rows().len();
+    app.ensure_row_cache();
+    let count = app.row_cache.borrow().rows.len();
     app.selected = app.selected.min(count.saturating_sub(1));
     let rows = app.tree_rows();
     let multiple_hosts = app
@@ -2146,6 +2280,7 @@ mod tests {
         let text = rendered(&mut app, 160, 30);
         assert!(text.contains("Sessions") && text.contains("SYNTHETIC TERMINAL"));
         assert!(text.contains("Terminal · VIEW"));
+        assert!(text.contains("x stop terminal") && text.contains("q detach"));
         app.terminal_input = true;
         let text = rendered(&mut app, 160, 30);
         assert!(text.contains("Terminal · INPUT") && text.contains("Ctrl+]"));
@@ -2217,12 +2352,13 @@ mod tests {
         let mut app = App::default();
         app.set_snapshots(vec![snapshot(vec![unrelated, child, parent])]);
         let rows = app.tree_rows();
-        assert_eq!(rows[0].session.id, "parent-session");
-        assert_eq!(role_label(rows[0].session, rows[0].child_count), "Parent");
-        assert_eq!(model_label(rows[0].session), "Astra");
-        assert_eq!(rows[1].session.id, "child-session");
-        assert_eq!(role_label(rows[1].session, rows[1].child_count), "Subagent");
-        assert_eq!(model_label(rows[1].session), "Sol");
+        assert_eq!(rows[0].session.id, "unrelated");
+        assert_eq!(rows[1].session.id, "parent-session");
+        assert_eq!(role_label(rows[1].session, rows[1].child_count), "Parent");
+        assert_eq!(model_label(rows[1].session), "Astra");
+        assert_eq!(rows[2].session.id, "child-session");
+        assert_eq!(role_label(rows[2].session, rows[2].child_count), "Subagent");
+        assert_eq!(model_label(rows[2].session), "Sol");
 
         let rendered = rendered(&mut app, 180, 32);
         assert!(rendered.contains("Session"));
@@ -2418,6 +2554,9 @@ mod tests {
         let mut app = App::default();
         let live = snapshot(vec![session("live", "workspace", Activity::Working)]);
         app.set_snapshots(vec![live.clone()]);
+        let stable = rendered(&mut app, 180, 32);
+        app.refreshing = true;
+        assert_eq!(rendered(&mut app, 180, 32), stable);
         app.ghostty_picker = Some(GhosttyPicker {
             session: live.sessions[0].clone(),
             terminals: Vec::new(),
@@ -2465,6 +2604,118 @@ mod tests {
 
         app.set_snapshots(vec![snapshot(vec![second, first])]);
         assert_eq!(app.selected_session().unwrap().id, "second");
+    }
+
+    #[test]
+    fn root_order_is_stable_across_collection_order_and_status_changes() {
+        let mut alpha_claude = session("claude-root", "alpha", Activity::Idle);
+        alpha_claude.provider = Provider::Claude;
+        alpha_claude.host = "a-host".into();
+        let mut alpha_codex = session("codex-root", "alpha", Activity::WaitingInput);
+        alpha_codex.host = "a-host".into();
+        let mut child = session("codex-child", "z-worktree", Activity::Working);
+        child.host = "a-host".into();
+        child.parent_id = Some(alpha_codex.id.clone());
+        let mut other_host = session("other-host-root", "alpha", Activity::Working);
+        other_host.host = "b-host".into();
+        let beta = session("beta-root", "beta", Activity::WaitingInput);
+
+        let expected = [
+            "claude-root",
+            "codex-root",
+            "codex-child",
+            "other-host-root",
+            "beta-root",
+        ];
+        let first = vec![
+            beta.clone(),
+            child.clone(),
+            other_host.clone(),
+            alpha_codex.clone(),
+            alpha_claude.clone(),
+        ];
+        let mut app = App {
+            show_background: true,
+            ..Default::default()
+        };
+        app.set_snapshots(vec![snapshot(first)]);
+        assert_eq!(
+            app.rows()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        app.selected = 2;
+
+        alpha_claude.activity = Activity::WaitingInput;
+        alpha_codex.activity = Activity::Ended;
+        child.activity = Activity::Idle;
+        other_host.activity = Activity::Unknown;
+        let second = vec![alpha_claude, alpha_codex, other_host, child, beta];
+        app.set_snapshots(vec![snapshot(second)]);
+
+        assert_eq!(
+            app.rows()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(app.selected_session().unwrap().id, "codex-child");
+    }
+
+    #[test]
+    fn row_cache_reuses_projection_and_invalidates_for_filters_folds_and_snapshots() {
+        let parent = session("parent", "alpha", Activity::Working);
+        let mut child = session("needle-child", "alpha-child", Activity::WaitingInput);
+        child.parent_id = Some(parent.id.clone());
+        let other = session("other", "beta", Activity::Idle);
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![
+            other.clone(),
+            child.clone(),
+            parent.clone(),
+        ])]);
+
+        let initial_builds = app.row_cache.borrow().builds;
+        assert_eq!(app.rows().len(), 3);
+        assert_eq!(app.selected_session().unwrap().id, "parent");
+        assert_eq!(app.rows().len(), 3);
+        assert_eq!(app.row_cache.borrow().builds, initial_builds);
+
+        app.query = "needle".into();
+        assert_eq!(app.rows()[0].id, "needle-child");
+        assert_eq!(app.row_cache.borrow().builds, initial_builds + 1);
+        app.query.clear();
+        assert_eq!(app.rows().len(), 3);
+        assert_eq!(app.row_cache.borrow().builds, initial_builds + 2);
+
+        app.selected = app
+            .rows()
+            .iter()
+            .position(|session| session.id == "parent")
+            .unwrap();
+        app.toggle_branch();
+        assert_eq!(app.rows().len(), 2);
+        assert_eq!(app.row_cache.borrow().builds, initial_builds + 3);
+
+        let mut added = session("added", "aardvark", Activity::Working);
+        added.host = "remote".into();
+        app.set_snapshots(vec![snapshot(vec![added, parent, child, other])]);
+        assert_eq!(app.selected_session().unwrap().id, "parent");
+        assert!(app.rows().iter().any(|session| session.id == "added"));
+        assert_eq!(app.row_cache.borrow().builds, initial_builds + 4);
+
+        app.needs_only = true;
+        assert_eq!(
+            app.rows()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["needle-child"]
+        );
+        assert_eq!(app.row_cache.borrow().builds, initial_builds + 5);
     }
 
     #[test]
@@ -2744,6 +2995,25 @@ mod tests {
         assert!(text.contains("Preview unavailable"));
         assert!(text.contains("readable tmux pane"));
         assert!(text.contains("p close"));
+    }
+
+    #[test]
+    fn ghostty_snapshot_shows_capture_progress_without_an_extra_prompt() {
+        let mut selected = session("snapshot", "ttybird", Activity::Idle);
+        selected.target = Some(Target::Ghostty {
+            terminal_id: "11111111-1111-4111-8111-111111111111".into(),
+        });
+        let mut app = App {
+            show_preview: true,
+            preview_notice: Some("Capturing Ghostty output…".into()),
+            ..Default::default()
+        };
+        app.set_snapshots(vec![snapshot(vec![selected])]);
+        let screen = rendered(&mut app, 160, 30);
+        assert!(screen.contains("Ghostty snapshot"));
+        assert!(screen.contains("Capturing Ghostty output"));
+        assert!(!screen.contains("Press r to capture"));
+        assert!(!app.preview_capture_requested);
     }
 
     #[test]

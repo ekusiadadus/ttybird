@@ -1,4 +1,4 @@
-//! Explicit, ephemeral preview of one verified local tmux pane.
+//! Explicit, ephemeral preview of one verified local terminal.
 //! Collection and JSON output never call this module.
 use std::time::Duration;
 
@@ -39,16 +39,18 @@ pub fn unavailable_reason(session: &Session, local_host: &str) -> Option<&'stati
     match session.target {
         Some(Target::Tmux { .. }) if session.tty.is_some() => None,
         Some(Target::Managed { .. }) => None,
-        Some(Target::Ghostty { .. }) => Some(
-            "This Ghostty tab cannot be embedded. Enter opens it; c shows conversation. For a new embedded session: ttybird run -- codex",
-        ),
+        Some(Target::Ghostty { .. }) if cfg!(target_os = "macos") => None,
         _ => Some(
-            "No readable terminal mapping. Use a local tmux pane or start a new embedded session with ttybird run -- codex.",
+            "No terminal mapping. Press g to link the correct Ghostty pane, then p to preview.",
         ),
     }
 }
 
-fn live_identity(session: &Session) -> Result<()> {
+pub fn manual_snapshot(session: &Session) -> bool {
+    matches!(session.target, Some(Target::Ghostty { .. }))
+}
+
+fn live_identity(session: &Session, require_tty: bool) -> Result<()> {
     let pid = session
         .pid
         .context("Preview needs a verified live process; this entry is history")?;
@@ -57,6 +59,9 @@ fn live_identity(session: &Session) -> Result<()> {
         .context("Process start time is unavailable")?;
     if collect::process_identity(pid) != Some(started) {
         bail!("Agent exited or PID was reused; refresh the session list");
+    }
+    if !require_tty {
+        return Ok(());
     }
     // Check the current process device, not just the cached observation.
     let out = run_bounded(
@@ -182,14 +187,20 @@ pub fn capture(session: &Session, local_host: &str) -> Result<Text<'static>> {
         .target
         .as_ref()
         .context("No tmux mapping. Run the agent in tmux or bind its exact pane.")?;
-    if !matches!(target, Target::Tmux { .. }) {
-        bail!(
-            "Ghostty screen capture is not available. Preview supports local tmux panes; Enter opens Ghostty."
-        );
-    }
-    live_identity(session)?;
-    let screen = capture_tmux(target, session.tty.as_deref().context("Missing agent TTY")?)?;
-    live_identity(session)?;
+    navigation::validate_target(target)?;
+    let require_tty = matches!(target, Target::Tmux { .. }) || session.tty.is_some();
+    live_identity(session, require_tty)?;
+    let screen = match target {
+        Target::Tmux { .. } => {
+            capture_tmux(target, session.tty.as_deref().context("Missing agent TTY")?)?
+        }
+        Target::Ghostty { terminal_id } => {
+            let bytes = crate::ghostty_export::capture(terminal_id)?;
+            crate::preview::parse_vt(&bytes, 120, 200)?
+        }
+        _ => bail!("This terminal does not support snapshot capture"),
+    };
+    live_identity(session, require_tty)?;
     Ok(screen)
 }
 
