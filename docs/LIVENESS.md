@@ -7,10 +7,33 @@ TTYbird observes three different things: a process, a logical agent session, and
 1. Enumerate same-user processes using sysinfo, match supported CLI executables/launchers, and exclude zombie/dead statuses. Sleeping or stopped processes still exist; they are not called working merely because they exist.
 2. Identify processes by PID and start time. Read `ps` for the current controlling TTY; reject empty/unknown markers, malformed paths, and missing/non-character devices. Headless command modes intentionally suppress inherited TTYs.
 3. Associate Codex/Claude logs only through a unique writable descriptor owner. A retained child log proves a hosting process association, not a currently running child. Raw process rows remain when no log association is available.
-4. Read bounded log samples. Running-state freshness uses the lifecycle record's own timestamp, not file mtime; unrelated metadata writes must not refresh old work. Missing/stale/omitted lifecycle records stay unknown. Model metadata has its separate bounded lookback.
+4. Read bounded log samples. Running-state freshness uses lifecycle and allowlisted turn-progress timestamps, not file mtime. Codex `item_completed`/`token_count` can refresh an explicitly sampled active turn, but cannot establish one after an unread gap: asynchronous progress can follow completion. Unrelated metadata writes never refresh old work. Missing, stale or gap-separated evidence stays unknown. Model metadata has its separate bounded lookback.
 5. Recheck process identity/status after sampling. A process that exits during collection loses its live row; its log can remain as history with no PID, TTY, or target.
 6. Apply saved navigation bindings only to an already observed matching PID/start/session. A saved binding cannot create live status for a historical log. Focus/preview revalidate identity again at use time.
 7. On refresh failure, the dashboard removes live PID/TTY/target claims from retained records and reports liveness unavailable. It does not keep presenting an old snapshot as currently live.
+
+## Runtime activity versus last recorded activity
+
+When the existing local Codex app-server control socket is available, TTYbird
+reads `thread/read` with `includeTurns: false` for already discovered live-associated
+sessions. It does not start a daemon, resume a thread, subscribe to conversation
+events, send input, or acknowledge approvals. Only runtime state is retained;
+preview/turn content returned by the protocol is discarded. The same-user Unix
+socket observer has a 1.5-second total I/O deadline, 64-thread limit, and bounded
+responses. It is compatible with the 0.154.0 protocol verified locally; older or
+embedded Codex instances fall back to log evidence. `notLoaded` from one server
+does not prove that a session in another server has ended.
+
+`Working`, `Ready` (no active turn), and `Needs input` represent a server state
+snapshot, not a continuous guarantee. The summary shows its age. `Active log`
+and `Last reply` describe recorded activity; a completed response is not proof
+that the user's task is complete. `Unknown` does not mean stopped. Process
+liveness and navigation remain separate evidence.
+
+Claude hooks retain their own event timestamps. An older hook cannot overwrite
+newer known transcript activity for the same process identity. Without configured
+TTYbird hooks there is no observed Claude hook state; transcript inference remains
+available. `PreToolUse` is shown as `Tool started`, not proof of an ongoing wait.
 
 The TUI hides log-only history by default. `h` or `--history` shows it explicitly. It also hides hosted children whose activity is idle, ended or unknown; `b` reveals these retained children and raw headless processes. Unknown children may still be doing work that passive collection cannot observe, so this is a presentation filter, not a declaration that they have ended. Roots and children with fresh working/waiting evidence remain visible. JSON snapshots retain the evidence; `--live-only` filters by current process association, including retained sessions on live backends. It does not mean active model calls only.
 

@@ -787,22 +787,75 @@ fn provider_label(provider: &Provider) -> &'static str {
 }
 
 fn state_label(session: &Session) -> &'static str {
+    if let Some(observation) = &session.insights.activity_observation {
+        if observation.source == "codex_app_server"
+            && session.confidence == Confidence::Observed
+            && session.pid.is_some()
+        {
+            return match observation.event.as_str() {
+                "active" => "Working",
+                "idle" => "Ready",
+                "waiting_for_input" => "Needs input",
+                "system_error" => "Error",
+                _ => "Unknown",
+            };
+        }
+        if session.activity == Activity::Idle {
+            return match observation.event.as_str() {
+                "turn_aborted" => "Interrupted",
+                "SessionStart" => "Started",
+                "Notification:idle_prompt" => "Prompt idle",
+                _ => "Last reply",
+            };
+        }
+        if observation.source == "claude_hook" && session.activity == Activity::WaitingTool {
+            return "Tool started";
+        }
+    }
     if session.activity == Activity::Unknown || session.confidence == Confidence::Unknown {
-        return "Unverified";
+        return "Unknown";
     }
     match (&session.activity, &session.confidence) {
         (Activity::Working, Confidence::Observed) => "Working",
-        (Activity::Working, Confidence::Inferred) => "Working?",
+        (Activity::Working, Confidence::Inferred) => "Active log",
         (Activity::WaitingInput, Confidence::Observed) => "Needs input",
         (Activity::WaitingInput, Confidence::Inferred) => "Input?",
         (Activity::WaitingTool, Confidence::Observed) => "Tool wait",
         (Activity::WaitingTool, Confidence::Inferred) => "Tool wait?",
         (Activity::Idle, Confidence::Observed) => "Idle",
-        (Activity::Idle, Confidence::Inferred) => "Idle?",
+        (Activity::Idle, Confidence::Inferred) => "Last reply",
         (Activity::Ended, Confidence::Observed) => "Ended",
         (Activity::Ended, Confidence::Inferred) => "Ended?",
-        (_, Confidence::Unknown) | (Activity::Unknown, _) => "Unverified",
+        (_, Confidence::Unknown) | (Activity::Unknown, _) => "Unknown",
     }
+}
+
+fn activity_evidence(session: &Session) -> String {
+    let Some(observation) = &session.insights.activity_observation else {
+        return if session.pid.is_some() {
+            "Host process is live; current activity is not available.".into()
+        } else {
+            "History only; current activity is not available.".into()
+        };
+    };
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(observation.observed_at);
+    let age = if age < 0 {
+        "clock differs".into()
+    } else if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else {
+        format!("{}h ago", age / 3600)
+    };
+    let source = match observation.source.as_str() {
+        "codex_app_server" => "Codex live server",
+        "claude_hook" => "Claude hook",
+        _ => "Log event",
+    };
+    format!("{source}: {} · {age}", sanitize(&observation.event, 80))
 }
 
 fn confidence_label(confidence: &Confidence) -> &'static str {
@@ -1315,6 +1368,7 @@ fn detail_lines(session: Option<&Session>, snapshots: &[Snapshot]) -> Vec<Line<'
         ),
         value("Session ID", sanitize(&session.id, 220)),
         value("Role", role_detail(session, child_count)),
+        value("State evidence", activity_evidence(session)),
         value(
             "Agent",
             format!(
@@ -1414,6 +1468,17 @@ fn render_details(
             )),
             Line::from(""),
         ];
+        lines.push(Line::from(activity_evidence(session)));
+        if session
+            .insights
+            .activity_observation
+            .as_ref()
+            .is_none_or(|o| o.source != "codex_app_server")
+        {
+            lines.push(Line::from(
+                "Log/hook evidence describes the last event, not a live status query.",
+            ));
+        }
         if let Some(usage) = &session.insights.usage {
             let scope = if usage.scope == crate::model::TokenUsageScope::Sampled {
                 "sampled messages only"
@@ -2018,6 +2083,27 @@ mod tests {
             sessions,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runtime_idle_and_recorded_reply_are_distinct_and_failed_refresh_is_unknown() {
+        let mut s = session("status", "ttybird", Activity::Idle);
+        s.confidence = Confidence::Inferred;
+        s.insights.activity_observation = Some(crate::model::ActivityObservation {
+            source: "codex_log".into(),
+            event: "task_complete".into(),
+            observed_at: 200,
+        });
+        assert_eq!(state_label(&s), "Last reply");
+        s.confidence = Confidence::Observed;
+        let observation = s.insights.activity_observation.as_mut().unwrap();
+        observation.source = "codex_app_server".into();
+        observation.event = "idle".into();
+        assert_eq!(state_label(&s), "Ready");
+        let mut app = App::default();
+        app.set_snapshots(vec![snapshot(vec![s])]);
+        app.invalidate_liveness();
+        assert_eq!(state_label(&app.snapshots[0].sessions[0]), "Unknown");
     }
 
     #[test]

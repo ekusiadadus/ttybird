@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod codex_status;
 pub mod collect;
 pub mod config;
 pub mod handoff;

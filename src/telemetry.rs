@@ -1,7 +1,7 @@
 //! Optional Claude hooks supply lifecycle evidence without retaining conversation content.
 use crate::{
     config,
-    model::{Activity, Confidence, Provider, Session, Snapshot},
+    model::{Activity, ActivityObservation, Confidence, Provider, Session, Snapshot},
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,14 @@ pub fn enrich(dir: &Path, snapshot: &mut Snapshot) -> Result<()> {
                 "stale (>5m); PID/start verified"
             }
         );
+        let insights = crate::model::SessionInsights {
+            activity_observation: Some(ActivityObservation {
+                source: "claude_hook".to_owned(),
+                event: event.event.clone(),
+                observed_at: event.timestamp,
+            }),
+            ..Default::default()
+        };
         let session = Session {
             id: event.session_id.clone(),
             provider: Provider::Claude,
@@ -175,7 +183,7 @@ pub fn enrich(dir: &Path, snapshot: &mut Snapshot) -> Result<()> {
             tty: None,
             cwd: event.cwd,
             model: None,
-            insights: Default::default(),
+            insights,
             activity,
             confidence: if fresh {
                 Confidence::Observed
@@ -201,10 +209,26 @@ pub fn enrich(dir: &Path, snapshot: &mut Snapshot) -> Result<()> {
 }
 
 fn merge_observation(existing: &mut Session, mut observed: Session) {
-    if existing.pid == observed.pid && existing.process_started_at == observed.process_started_at {
+    let same_identity =
+        existing.pid == observed.pid && existing.process_started_at == observed.process_started_at;
+    let existing_is_newer_known = same_identity
+        && existing.activity != Activity::Unknown
+        && existing.confidence != Confidence::Unknown
+        && existing
+            .insights
+            .activity_observation
+            .as_ref()
+            .zip(observed.insights.activity_observation.as_ref())
+            .is_some_and(|(existing, observed)| existing.observed_at > observed.observed_at);
+    if existing_is_newer_known {
+        return;
+    }
+    if same_identity {
+        let activity_observation = observed.insights.activity_observation.take();
         observed.tty = existing.tty.clone();
         observed.target = existing.target.clone();
         observed.insights = existing.insights.clone();
+        observed.insights.activity_observation = activity_observation;
         observed.parent_id = existing.parent_id.clone();
     }
     observed.model = existing.model.clone();
@@ -214,6 +238,126 @@ fn merge_observation(existing: &mut Session, mut observed: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observation(source: &str, event: &str, observed_at: i64) -> ActivityObservation {
+        ActivityObservation {
+            source: source.to_owned(),
+            event: event.to_owned(),
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn older_stale_hook_does_not_replace_newer_known_log_activity() {
+        let mut existing: Session = serde_json::from_value(serde_json::json!({
+            "id":"session","provider":"claude","parent_id":null,"host":"local",
+            "pid":10,"process_started_at":100,"tty":"/dev/pts/1","cwd":"/work",
+            "model":"fixture","activity":"idle","confidence":"inferred",
+            "evidence":"newer transcript lifecycle","updated_at":200,"target":null
+        }))
+        .unwrap();
+        existing.insights.activity_observation =
+            Some(observation("claude_log", "assistant:end_turn", 200));
+        let mut hook = existing.clone();
+        hook.activity = Activity::Unknown;
+        hook.confidence = Confidence::Unknown;
+        hook.evidence = "Claude hook PreToolUse; stale (>5m); PID/start verified".to_owned();
+        hook.updated_at = Some(100);
+        hook.insights.activity_observation = Some(observation("claude_hook", "PreToolUse", 100));
+
+        merge_observation(&mut existing, hook);
+
+        assert_eq!(existing.activity, Activity::Idle);
+        assert_eq!(existing.confidence, Confidence::Inferred);
+        assert_eq!(existing.updated_at, Some(200));
+        assert_eq!(
+            existing.insights.activity_observation,
+            Some(observation("claude_log", "assistant:end_turn", 200))
+        );
+    }
+
+    #[test]
+    fn newer_hook_replaces_log_activity_and_keeps_other_insights() {
+        let mut existing: Session = serde_json::from_value(serde_json::json!({
+            "id":"session","provider":"claude","parent_id":"parent","host":"local",
+            "pid":10,"process_started_at":100,"tty":"/dev/pts/1","cwd":"/work",
+            "model":"fixture","activity":"idle","confidence":"inferred",
+            "evidence":"older transcript lifecycle","updated_at":100,
+            "target":{"kind":"tmux","socket":null,"pane":"%1"}
+        }))
+        .unwrap();
+        existing.insights.title = Some("Preserved task title".to_owned());
+        existing.insights.activity_observation =
+            Some(observation("claude_log", "assistant:end_turn", 100));
+        let mut hook = existing.clone();
+        hook.parent_id = None;
+        hook.tty = None;
+        hook.target = None;
+        hook.activity = Activity::WaitingInput;
+        hook.confidence = Confidence::Observed;
+        hook.evidence = "Claude hook PermissionRequest; lifecycle event".to_owned();
+        hook.updated_at = Some(200);
+        hook.insights = Default::default();
+        hook.insights.activity_observation =
+            Some(observation("claude_hook", "PermissionRequest", 200));
+
+        merge_observation(&mut existing, hook);
+
+        assert_eq!(existing.activity, Activity::WaitingInput);
+        assert_eq!(existing.confidence, Confidence::Observed);
+        assert_eq!(existing.updated_at, Some(200));
+        assert_eq!(existing.tty.as_deref(), Some("/dev/pts/1"));
+        assert!(existing.target.is_some());
+        assert_eq!(existing.parent_id.as_deref(), Some("parent"));
+        assert_eq!(
+            existing.insights.title.as_deref(),
+            Some("Preserved task title")
+        );
+        assert_eq!(
+            existing.insights.activity_observation,
+            Some(observation("claude_hook", "PermissionRequest", 200))
+        );
+    }
+
+    #[test]
+    fn different_process_identity_is_not_suppressed_by_timestamp_ordering() {
+        let mut existing: Session = serde_json::from_value(serde_json::json!({
+            "id":"session","provider":"claude","parent_id":null,"host":"local",
+            "pid":10,"process_started_at":100,"tty":"/dev/pts/1","cwd":"/work",
+            "model":"fixture","activity":"idle","confidence":"inferred",
+            "evidence":"newer old-process transcript","updated_at":200,
+            "target":{"kind":"tmux","socket":null,"pane":"%1"}
+        }))
+        .unwrap();
+        existing.insights.title = Some("Old process title".to_owned());
+        existing.insights.activity_observation =
+            Some(observation("claude_log", "assistant:end_turn", 200));
+        let mut hook = existing.clone();
+        hook.pid = Some(20);
+        hook.process_started_at = Some(300);
+        hook.tty = None;
+        hook.target = None;
+        hook.activity = Activity::Working;
+        hook.confidence = Confidence::Observed;
+        hook.updated_at = Some(100);
+        hook.insights = Default::default();
+        hook.insights.activity_observation =
+            Some(observation("claude_hook", "UserPromptSubmit", 100));
+
+        merge_observation(&mut existing, hook);
+
+        assert_eq!(existing.pid, Some(20));
+        assert_eq!(existing.process_started_at, Some(300));
+        assert_eq!(existing.activity, Activity::Working);
+        assert!(existing.tty.is_none());
+        assert!(existing.target.is_none());
+        assert!(existing.insights.title.is_none());
+        assert_eq!(
+            existing.insights.activity_observation,
+            Some(observation("claude_hook", "UserPromptSubmit", 100))
+        );
+    }
+
     #[test]
     fn resumed_hook_never_inherits_another_process_terminal() {
         let old:Session=serde_json::from_value(serde_json::json!({"id":"session","provider":"claude","parent_id":null,"host":"local","pid":10,"process_started_at":100,"tty":"/dev/pts/1","cwd":null,"model":"fixture","activity":"unknown","confidence":"observed","evidence":"fixture","updated_at":null,"target":{"kind":"tmux","socket":null,"pane":"%1"}})).unwrap();

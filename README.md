@@ -132,6 +132,12 @@ a parent with no displayable children has no expand arrow or child count.
 Space changes only branches that can reveal rows. `b` reveals retained children;
 recorded relationships remain in Details.
 
+On supported local Codex app-server sessions, `Working`, `Ready` (no active turn),
+and `Needs input` come from a read-only runtime query. No daemon or model is
+started. If that API is unavailable, `Active log` / `Last reply` describe the
+latest recorded event; `Unknown` is not a claim that work stopped. The right pane
+shows the evidence source and age. See [state semantics](docs/LIVENESS.md).
+
 For a child without its own terminal, Enter opens its **recorded parent's**
 terminal. Only the parent needs the initial Ghostty mapping. `c` still opens the
 selected child's conversation; the status line states the Enter destination.

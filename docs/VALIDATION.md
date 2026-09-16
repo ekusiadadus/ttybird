@@ -34,10 +34,11 @@ explicitly; CI runs it in addition to the ordinary suite.
 | Boundary | Evidence | What is not established |
 |---|---|---|
 | Process/session identity | Real synthetic live process, descriptor close, stale binding, zombie and exit; comparison with `ps` | Every provider's live API state; atomic OS snapshot |
+| Codex runtime status | Existing 0.154.0 daemon read-only check; synthetic Unix WebSocket active/idle/input states, unavailable/unknown flags, timeout, incomplete/rejected responses and no retained preview content | Embedded/older servers, instantaneous consistency or all future protocol versions |
 | Parent/child display | Scoped links, cycle handling, folds, filter and selection transitions, no empty branch affordance, retained child reveal and waiting-child expansion | Independently executing model calls for each visible child |
 | VT conversion | Pinned native libghostty-vt parses captures; owned text/styles are rendered by Ratatui | Full Ghostty GUI renderer equivalence, arbitrary PTY streams or graphics |
 | tmux preview | Real private pane; colors/Unicode/CR/erase, alternate screen, wrong identity, unchanged pane/buffers | Arbitrary tmux versions and remote capture |
-| Dashboard | Real PTY, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings, preview close/reopen | Exhaustive terminal emulators/keymaps |
+| Dashboard | Real PTY, tree/details/search controls, resize, q/Ctrl-C/SIGTERM and incomplete-input termination, terminal configuration/status-flag restoration, PTY hangup at multiple timings | Exhaustive terminal emulators/keymaps |
 | Owned terminals | Real PTY + libghostty screen, explicit input/paste and Ctrl-C, Ctrl+] returning to the list, detach/reconnect, resize, private IPC, no screen persistence, stop cleanup | Every coding CLI, nested job-control programs, mouse/graphics, recovery after daemon/host failure |
 | Workspace metadata | Temporary real Git repositories, dirty/untracked paths, subdirectories, symlinks, detached HEAD, linked worktrees, caching and truncation | Network remotes, submodule contents, semantic meaning of a change |
 | Attention inbox | Synthetic observed hook transitions, sustained-event deduplication, read/acknowledge/snooze, stale expiry, restart deduplication and failed-delivery backoff with a fake notifier | A real desktop notification daemon, provider states without hook evidence, task completion |

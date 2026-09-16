@@ -137,6 +137,8 @@ pub struct TokenUsage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInsights {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_observation: Option<ActivityObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::WorkspaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharing: Option<String>,
@@ -145,6 +147,14 @@ pub struct SessionInsights {
     /// Collection-only identity for explicit, revalidated local conversation reads.
     #[serde(skip)]
     pub(crate) log_path: Option<PathBuf>,
+}
+
+/// State evidence has its own clock: a log's modification time is not activity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivityObservation {
+    pub source: String,
+    pub event: String,
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

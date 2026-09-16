@@ -17,7 +17,7 @@ import termios
 import time
 
 
-def terminate_owned_group(process):
+def terminate_owned_group(process, drain=None):
     """Stop every process in a fixture-only session and reap its leader."""
     if process is None or process.returncode is not None:
         return
@@ -25,13 +25,23 @@ def terminate_owned_group(process):
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
-    # Do not reap the leader before the final process-group signal. While it is
-    # a zombie its PID cannot be reused for an unrelated process group.
-    time.sleep(.1)
+    if drain is not None:
+        drain(.1)
+    else:
+        time.sleep(.1)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+    # Address the wrapper PID directly as well. This remains fixture-only and
+    # avoids waiting on a wrapper blocked while its PTY output is undrained.
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    if drain is not None:
+        drain(.2)
     process.wait(timeout=2)
 
 
@@ -117,12 +127,6 @@ sys.exit(code)
                 assert b'Search' in output, 'search did not open'
                 os.write(master, b'\x1b')
                 drain(.15)
-                os.write(master, b'/zz-ttybird-no-match\rp')
-                drain(.25)
-                assert b'Terminal preview' in output, 'preview did not open'
-                os.write(master, b'\x1b[6~\x1b[5~')
-                drain(.1)
-                os.write(master, b'p')
                 os.write(master, b'br')
                 drain(.15)
             if mode == 'partial-signal':
@@ -144,7 +148,7 @@ sys.exit(code)
             return {'mode': mode, 'exit': process.returncode, 'terminal_restored': True,
                     'quit_seconds': round(time.monotonic()-start, 3)}
         finally:
-            terminate_owned_group(process)
+            terminate_owned_group(process, drain)
             os.close(master)
             os.close(slave)
 

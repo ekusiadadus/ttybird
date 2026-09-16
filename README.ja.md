@@ -115,6 +115,12 @@ Ghosttyの初回紐付けは親に一度だけ行います。子自身の会話�
 スクリプトには`--plain`、`--json`、`--watch --json`を使えます。
 `ttybird doctor`で実行環境、`ttybird providers`で対応能力を確認できます。
 
+対応するローカルCodexでは、稼働中のapp-serverへ読み取り専用で問い合わせて
+`Working`・`Ready`（実行中のターンなし）・`Needs input`を表示します。
+daemonやモデルは新規起動しません。取得できない場合の`Active log`・`Last reply`は
+最後のログイベントを表し、`Unknown`は停止の断定ではありません。右側に情報源と
+確認からの経過時間を表示します。詳しくは[状態判定](docs/LIVENESS.md)を参照してください。
+
 ## ワークスペース・通知・確認付き引き継ぎ
 
 Git checkout内のセッションには、checkout/worktree、branchまたはdetached HEAD、
@@ -124,7 +130,7 @@ commit、dirty状態を表示します。Gitの調査は読み取り専用かつ
 
 **N** で永続化されたattention inboxを開きます。対象は、任意のClaude hooksから
 直接観測した権限・入力要求、応答終了、tool失敗だけです。通常の`PreToolUse`はtoolの
-実行中を示すため、承認要求として扱いません。**m** で選択中の発生を確認済みにし、
+開始前のイベントなので、承認要求として扱いません。**m** で選択中の発生を確認済みにし、
 **z** で通知を10分後に延期します。既読の発生は現在のdesktop通知を抑制し、後から
 新しい観測が届けば別の発生として開きます。古い観測や到達不能なhostは「停止」と
 断定せず、期限切れにします。明示的にスヌーズした場合は過去の観測に基づくreminderを

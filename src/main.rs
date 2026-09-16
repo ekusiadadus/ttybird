@@ -198,6 +198,7 @@ fn options(cli: &Cli) -> CollectOptions {
 
 fn local_snapshot(cli: &Cli, dir: &std::path::Path) -> Result<Snapshot> {
     let mut snapshot = collect::collect(&options(cli))?;
+    ttybird::codex_status::enrich(&mut snapshot);
     if let Err(e) = telemetry::enrich(dir, &mut snapshot) {
         snapshot
             .warnings

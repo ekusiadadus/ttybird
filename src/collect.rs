@@ -16,8 +16,8 @@ use walkdir::WalkDir;
 
 use crate::{
     model::{
-        Activity, Confidence, Provider, Session, SessionInsights, Snapshot, TokenUsage,
-        TokenUsageScope,
+        Activity, ActivityObservation, Confidence, Provider, Session, SessionInsights, Snapshot,
+        TokenUsage, TokenUsageScope,
     },
     providers,
     remote::run_bounded,
@@ -204,6 +204,7 @@ pub fn collect(options: &CollectOptions) -> Result<Snapshot> {
                 .contains(&snapshot.collected_at.saturating_sub(timestamp))
         });
         let insights = SessionInsights {
+            activity_observation: activity_observation(log.provider, parsed.state, parsed.state_at),
             workspace: None,
             sharing: None,
             title: if log.provider == Provider::Codex {
@@ -1125,6 +1126,17 @@ fn parse_codex_sample(sample: SampledLines) -> ParsedLog {
                 if let Some(state) = state {
                     parsed.state = state;
                     parsed.state_at = record_timestamp(&value);
+                } else if matches!(event_type, Some("item_completed" | "token_count"))
+                    && parsed.state == LogState::Started
+                    && let Some(observed_at) = record_timestamp(&value)
+                    && parsed
+                        .state_at
+                        .is_none_or(|previous| observed_at >= previous)
+                {
+                    // Refresh only an explicitly sampled start. Asynchronous
+                    // progress can arrive after task_complete, so it cannot
+                    // establish a turn after an unread gap or unknown state.
+                    parsed.state_at = Some(observed_at);
                 }
                 if event_type == Some("token_count")
                     && let Some(usage) = codex_total_usage(&value)
@@ -1341,6 +1353,32 @@ fn activity(state: LogState, live: bool, lifecycle_is_fresh: bool) -> Activity {
     }
 }
 
+fn activity_observation(
+    provider: Provider,
+    state: LogState,
+    observed_at: Option<i64>,
+) -> Option<ActivityObservation> {
+    let source = match provider {
+        Provider::Codex => "codex_log",
+        Provider::Claude => "claude_log",
+        _ => return None,
+    };
+    let event = match state {
+        LogState::Started => "turn_activity",
+        LogState::Completed => "task_complete",
+        LogState::Aborted => "turn_aborted",
+        LogState::ClaudeUser => "user",
+        LogState::ClaudeStreaming => "assistant",
+        LogState::ClaudeStopped => "end_turn",
+        LogState::Unknown => return None,
+    };
+    Some(ActivityObservation {
+        source: source.to_owned(),
+        event: event.to_owned(),
+        observed_at: observed_at?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,6 +1549,120 @@ mod tests {
             activity(LogState::Completed, true, false),
             Activity::Unknown
         );
+    }
+
+    #[test]
+    fn codex_progress_does_not_cross_a_gap_but_refreshes_a_sampled_start() {
+        let across_gap = parse_codex_sample(SampledLines {
+            lines: vec![
+                br#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#.to_vec(),
+                br#"{"timestamp":"2026-01-01T00:10:00Z","type":"event_msg","payload":{"type":"item_completed"}}"#.to_vec(),
+            ],
+            tail_after_gap: Some(1),
+        });
+        assert_eq!(across_gap.state, LogState::Unknown);
+        assert_eq!(across_gap.state_at, None);
+
+        let refreshed = parse_codex(vec![
+            br#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#.to_vec(),
+            br#"{"timestamp":"2026-01-01T00:10:00Z","type":"event_msg","payload":{"type":"token_count"}}"#.to_vec(),
+        ]);
+        assert_eq!(refreshed.state, LogState::Started);
+        assert_eq!(refreshed.state_at, Some(1767226200));
+    }
+
+    #[test]
+    fn codex_progress_never_reopens_a_terminal_state() {
+        for terminal_event in ["task_complete", "turn_aborted"] {
+            let terminal = format!(
+                r#"{{"timestamp":"2026-01-01T00:01:00Z","type":"event_msg","payload":{{"type":"{terminal_event}"}}}}"#
+            );
+            let parsed = parse_codex(vec![
+                br#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#.to_vec(),
+                terminal.into_bytes(),
+                br#"{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"token_count"}}"#.to_vec(),
+                br#"{"timestamp":"2026-01-01T00:03:00Z","type":"event_msg","payload":{"type":"item_completed"}}"#.to_vec(),
+            ]);
+            assert_eq!(
+                parsed.state,
+                if terminal_event == "task_complete" {
+                    LogState::Completed
+                } else {
+                    LogState::Aborted
+                }
+            );
+            assert_eq!(parsed.state_at, Some(1767225660));
+        }
+
+        let restarted = parse_codex(vec![
+            br#"{"timestamp":"2026-01-01T00:01:00Z","type":"event_msg","payload":{"type":"task_complete"}}"#.to_vec(),
+            br#"{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"token_count"}}"#.to_vec(),
+            br#"{"timestamp":"2026-01-01T00:03:00Z","type":"event_msg","payload":{"type":"task_started"}}"#.to_vec(),
+        ]);
+        assert_eq!(restarted.state, LogState::Started);
+        assert_eq!(restarted.state_at, Some(1767225780));
+    }
+
+    #[test]
+    fn codex_progress_cannot_establish_state_and_requires_a_timestamp_to_refresh() {
+        let no_lifecycle = parse_codex(vec![
+            br#"{"timestamp":"2026-01-01T00:01:00Z","type":"event_msg","payload":{"type":"token_count"}}"#.to_vec(),
+            br#"{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"item_completed"}}"#.to_vec(),
+        ]);
+        assert_eq!(no_lifecycle.state, LogState::Unknown);
+        assert_eq!(no_lifecycle.state_at, None);
+
+        let missing = parse_codex(vec![
+            br#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}"#.to_vec(),
+            br#"{"type":"event_msg","payload":{"type":"token_count"}}"#.to_vec(),
+            br#"{"type":"event_msg","payload":{"type":"item_completed"}}"#.to_vec(),
+        ]);
+        assert_eq!(missing.state, LogState::Started);
+        assert_eq!(missing.state_at, Some(1767225600));
+    }
+
+    #[test]
+    fn activity_observations_use_stable_provider_event_names() {
+        for (provider, state, source, event) in [
+            (
+                Provider::Codex,
+                LogState::Started,
+                "codex_log",
+                "turn_activity",
+            ),
+            (
+                Provider::Codex,
+                LogState::Completed,
+                "codex_log",
+                "task_complete",
+            ),
+            (
+                Provider::Codex,
+                LogState::Aborted,
+                "codex_log",
+                "turn_aborted",
+            ),
+            (Provider::Claude, LogState::ClaudeUser, "claude_log", "user"),
+            (
+                Provider::Claude,
+                LogState::ClaudeStreaming,
+                "claude_log",
+                "assistant",
+            ),
+            (
+                Provider::Claude,
+                LogState::ClaudeStopped,
+                "claude_log",
+                "end_turn",
+            ),
+        ] {
+            let observation = activity_observation(provider, state, Some(42)).unwrap();
+            assert_eq!(observation.source, source);
+            assert_eq!(observation.event, event);
+            assert_eq!(observation.observed_at, 42);
+        }
+        assert!(activity_observation(Provider::Codex, LogState::Unknown, Some(42)).is_none());
+        assert!(activity_observation(Provider::Codex, LogState::Started, None).is_none());
     }
 
     #[test]
@@ -1928,7 +2080,7 @@ mod tests {
         );
         line(
             &mut file,
-            serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            serde_json::json!({"timestamp":"2026-09-15T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}),
         );
         drop(file);
 
@@ -1948,5 +2100,13 @@ mod tests {
         assert_eq!(session.activity, Activity::Unknown);
         assert_eq!(session.confidence, Confidence::Inferred);
         assert!(session.evidence.contains("historical"));
+        assert_eq!(
+            session.insights.activity_observation,
+            Some(ActivityObservation {
+                source: "codex_log".to_owned(),
+                event: "turn_activity".to_owned(),
+                observed_at: 1789430400,
+            })
+        );
     }
 }
